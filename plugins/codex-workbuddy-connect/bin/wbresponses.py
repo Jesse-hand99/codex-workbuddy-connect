@@ -77,10 +77,15 @@ def _tool_choice_to_chat(tc: Any) -> Any:
     if tc is None or isinstance(tc, str):
         return tc
     if isinstance(tc, dict):
-        if tc.get("type") == "function" and tc.get("name"):
-            return {"type": "function", "function": {"name": tc["name"]}}
+        kind = tc.get("type")
+        if kind in ("auto", "required", "none"):
+            return kind
+        if kind == "function" and tc.get("name"):
+            return tc["name"]
         if isinstance(tc.get("function"), dict):
-            return {"type": "function", "function": {"name": tc["function"].get("name")}}
+            name = tc["function"].get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
     return None
 
 
@@ -168,12 +173,15 @@ def request_to_chat(payload: dict, *, default_system: str = "You are a helpful a
 
     tools = _tools_to_chat(payload.get("tools"))
     if tools:
-        chat["tools"] = tools
         choice = _tool_choice_to_chat(payload.get("tool_choice"))
-        if choice is not None:
-            chat["tool_choice"] = choice
-        if isinstance(payload.get("parallel_tool_calls"), bool):
-            chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
+        # Upstream rejects tool_choice objects and expects a string. "none"
+        # also carries no tool definitions, matching the desktop client.
+        if not (isinstance(choice, str) and choice.lower() == "none"):
+            chat["tools"] = tools
+            if choice is not None:
+                chat["tool_choice"] = choice
+            if isinstance(payload.get("parallel_tool_calls"), bool):
+                chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
 
     effort = _effort_of(payload.get("reasoning"))
     if effort:

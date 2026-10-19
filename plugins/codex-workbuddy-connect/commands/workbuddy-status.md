@@ -57,4 +57,4 @@ python "<插件根>\bin\watch_plugin.py" --once
 | `--status` 说「未激活」 | `[plugins."codex-workbuddy-connect@workbuddy"] enabled = false`，或被卸载 |
 | 代理在跑但桌面端仍报错 | 看 `%TEMP%\wbproxy.log` 的上游错误行（429 → `code 14003`） |
 | 新会话不自启代理 | hook 未信任（`trustStatus: untrusted`）→ 桌面端 设置 → Hooks → Trust all |
-| 桌面端看不到 WorkBuddy 模型 | `model_catalog.json` 没生成对 → 重跑 `install.cmd` |
+| 桌面端看不到 WorkBuddy 模型 | `model_catalog_json` 没生成对或没绑定 → 重跑 `install.cmd` |

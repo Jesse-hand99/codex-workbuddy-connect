@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -38,7 +39,7 @@ MARK_END = "<!-- END codex-workbuddy-connect -->"
 
 PROVIDER_BLOCK = f"""[model_providers.{PROVIDER}]
 name = "WorkBuddy"
-base_url = "http://127.0.0.1:{{port}}/v1"
+base_url = "http://localhost:{{port}}/v1"
 # 本地代理不校验密钥，占位即可（真正的登录态在代理里）
 experimental_bearer_token = "workbuddy-local"
 wire_api = "responses"
@@ -48,7 +49,19 @@ request_max_retries = 6
 stream_max_retries = 6
 """
 
-PROFILE_BODY = f"""# Codex profile：走 WorkBuddy（本地代理）
+def profile_body(home: Path) -> str:
+    """Render the WorkBuddy profile, including its own model catalog."""
+    catalog_path = home / "workbuddy-catalog.json"
+    catalog_text = catalog_path.as_posix()
+    # Keep an already-absolute Windows drive path intact when tests run on
+    # POSIX; Path.resolve() would otherwise prefix the current directory.
+    if re.match(r"^[A-Za-z]:/", catalog_text):
+        catalog = catalog_text
+    elif catalog_path.is_absolute():
+        catalog = catalog_text
+    else:
+        catalog = str(catalog_path.absolute()).replace("\\", "/")
+    return f"""# Codex profile：走 WorkBuddy（本地代理）
 #
 # 用法：codex --profile {PROFILE_NAME}
 # 前提：代理在跑 → scripts\\start-wbproxy.cmd（或 scripts\\codex-wb.cmd 会自动拉起）
@@ -57,6 +70,7 @@ PROFILE_BODY = f"""# Codex profile：走 WorkBuddy（本地代理）
 model_provider = "{PROVIDER}"
 model = "deepseek-v4.1-flash"
 model_reasoning_effort = "low"
+model_catalog_json = "{catalog}"
 """
 
 AGENTS_RULE = f"""{MARK_BEGIN}
@@ -209,7 +223,7 @@ def step_profile(home: Path) -> Path | None:
     if prof.is_file():
         bak = backup(prof)
         print(f"  已存在 {prof.name}" + (f"，备份：{bak.name}" if bak else ""))
-    write_text_keep(prof, to_newline(PROFILE_BODY, "\r\n"))
+    write_text_keep(prof, to_newline(profile_body(home), "\r\n"))
     print(f"  已写入 profile：{prof.name}（用法：codex --profile {PROFILE_NAME}）")
     return prof
 
@@ -354,6 +368,7 @@ def cmd_install(args) -> int:
     print(f"  {PKG_ROOT / 'scripts' / 'codex-wb.cmd'}                 # TUI（自动拉起代理）")
     print(f"  {PKG_ROOT / 'scripts' / 'codex-wb.cmd'} exec \"任务\"      # 非交互")
     print(f"  codex --profile {PROFILE_NAME}                            # 已装 Codex 时")
+    print(f"  powershell -File {PKG_ROOT / 'scripts' / 'start-codex-app-wb.ps1'} [工作区]  # 桌面端")
     print("\n注意：桌面端切换模型不会写回 config.toml，代理会自动同步；")
     print("      旧的会话记住自己创建时的模型，改用「新聊天」才走新默认值。")
     return 0
@@ -434,10 +449,29 @@ def cmd_status(args) -> int:
     home = codex_home()
     cfg = home / "config.toml"
     text = read_text_keep(cfg) if cfg.is_file() else ""
+    prof = home / f"{PROFILE_NAME}.config.toml"
+    profile_text = read_text_keep(prof) if prof.is_file() else ""
+    catalog_file = home / "workbuddy-catalog.json"
+    catalog_slugs: set[str] = set()
+    if catalog_file.is_file():
+        try:
+            catalog_doc = json.loads(read_text_keep(catalog_file))
+            catalog_slugs = {
+                str(item.get("slug")) for item in catalog_doc.get("models", [])
+                if isinstance(item, dict) and item.get("slug")
+            }
+        except Exception:
+            catalog_slugs = set()
+    model_match = re.search(r'^model\s*=\s*"([^"]+)"', profile_text, re.M)
+    profile_model = model_match.group(1) if model_match else None
+    catalog_linked = catalog_file.resolve().as_posix() in profile_text.replace("\\", "/")
+    catalog_has_model = profile_model in catalog_slugs if profile_model else False
     print(f"CODEX_HOME          : {home}")
     print(f"provider 段已安装    : {f'[model_providers.{PROVIDER}]' in text}")
-    print(f"profile 文件        : {(home / (PROFILE_NAME + '.config.toml')).is_file()}")
-    print(f"模型目录            : {(home / 'workbuddy-catalog.json').is_file()}")
+    print(f"profile 文件        : {prof.is_file()}")
+    print(f"模型目录            : {catalog_file.is_file()}")
+    print(f"profile 引用目录    : {catalog_linked}")
+    print(f"目录含 profile 模型 : {catalog_has_model} ({profile_model})")
     print(f"技能                : {(home / 'skills' / 'query-current-model').is_dir()}")
     ag = home / "AGENTS.md"
     print(f"AGENTS.md 规则      : {ag.is_file() and MARK_BEGIN in read_text_keep(ag)}")
@@ -446,7 +480,6 @@ def cmd_status(args) -> int:
                / "Start Menu" / "Programs" / "Startup" / "codex-workbuddy-connect-watch.vbs")
     print(f"代理看护自启   : {startup.is_file()}")
     if port_open(args.port):
-        import json
         import urllib.request
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/wb/last-model", timeout=10) as r:

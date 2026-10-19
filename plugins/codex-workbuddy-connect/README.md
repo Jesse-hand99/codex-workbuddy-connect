@@ -1,5 +1,15 @@
 # codex-workbuddy-connect
 
+> **1.5.5 修复（2026-10-20）**
+>
+> - 补上上游 `2026-10-16` 起要求的 `X-Conversation-ID` /
+>   `X-Conversation-Request-ID` / `X-Conversation-Message-ID`，修复
+>   `400 code 11128 / 请求被拦截`。
+> - `wb.config.toml` 现在显式引用自己的 `workbuddy-catalog.json`，不再回退到
+>   全局 DeepSeek 模型目录。
+> - `codex-wb.cmd` / `start-wbproxy.cmd` 默认忽略失效的 `HTTP(S)_PROXY`；
+>   确需企业代理时设置 `WB_KEEP_PROXY=1`。
+
 把 **WorkBuddy AI 桌面端**已登录的模型，变成 **Codex（CLI / 桌面端）**的模型源。
 
 不需要 OpenAI 订阅，不需要 Codex 套餐——Codex 只用它的 agent 骨架（读写文件、跑命令、apply_patch、
@@ -229,7 +239,7 @@ codex-workbuddy-connect/
 | **Windows** | — | 依赖 `CREATE_NO_WINDOW`、`%LOCALAPPDATA%`、直接调 `.exe`，非跨平台代码 |
 | **WorkBuddy AI 桌面端** | 已安装**且已登录** | 凭据来源。**不需要常驻运行**，装过登录过即可 |
 | **Python** | 3.10+，含 `cryptography` | 用于 AES-256-GCM 解密。`install.cmd` 会自动挑一个带 `cryptography` 的解释器 |
-| **Codex** | 0.153.x（已验证） | 见下文「版本」一节，**不要盲目升到 0.16x** |
+| **Codex** | 0.163.0-alpha.10.2（本机已做端到端验证） | 0.153+ 使用 Responses API；旧 0.16x 在本机曾受 unified-exec helper 问题影响 |
 
 上表四项**全部自动探测**，不需要改任何路径。先跑一次体检可以确认：
 
@@ -326,7 +336,28 @@ scripts\codex-wb.cmd -m hy3              换模型
 codex --profile wb                       已装 Codex 时直接用
 ```
 
+`codex-wb.cmd` 会默认清空失效的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`。
+如果直接运行 `codex --profile wb` 且本机代理变量被设置，先在 PowerShell 中执行：
+
+```powershell
+$env:HTTP_PROXY=''; $env:HTTPS_PROXY=''; $env:ALL_PROXY=''
+$env:http_proxy=''; $env:https_proxy=''; $env:all_proxy=''
+codex --profile wb
+```
+
+确实需要企业代理访问上游时，在启动器环境中设置 `WB_KEEP_PROXY=1`。
+
 桌面端图形界面同样可用：**必须新建会话**（详见下文「模型与会话」）。
+
+如果桌面端已经启动过，`codex app` 的单实例行为会复用现有进程，命令行
+`-c` 覆盖可能不生效。此时先完全退出桌面端，再从 PowerShell 运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-codex-app-wb.ps1 D:\your-workspace
+```
+
+该脚本只给本次桌面端启动注入 `workbuddy` provider、模型目录和默认模型，
+不修改全局默认 provider。进入后仍需**新建聊天**。
 
 ---
 
@@ -458,6 +489,8 @@ Codex 里有两层模型值，**极易误判**：
   （表现为一直报上游错误）。**改用「新聊天」**。
 - 桌面端用的 codex 是它自带的（`~/.codex/bin/<hash>/codex.exe`），**与 CLI 那份不同**，
   换二进制要分别验证。
+- 启动前必须先确认代理可访问：`curl.exe --noproxy "*" http://127.0.0.1:8787/health`。
+  若桌面端报 502，完全退出后使用 `scripts\start-codex-app-wb.ps1` 启动。
 
 ---
 
@@ -467,8 +500,11 @@ Codex 里有两层模型值，**极易误判**：
 |---|---|
 | `wire_api = "chat" is no longer supported` | Codex 版本太新，必须走 `responses`（本包已实现） |
 | `400 code 11128 Illegal API invocation` | 上游指纹拦截。确认用的是本包代理（含 `sanitize_system`） |
+| `400 code 11128 / 请求被拦截 / request illegal` | 1.5.4 缺少三个 `X-Conversation-*` 头；升级到 1.5.5 并重启代理 |
+| 本地 provider 返回 `502 Bad Gateway: Unknown error` | 进程继承了失效的 `HTTP(S)_PROXY`。用 `codex-wb.cmd`，或清除代理变量后再启动 Codex |
 | 模型说「没有可用的执行工具」 | 模型目录缺 `tool_mode` 等字段 → 重跑 `gen-catalog.py` |
 | 桌面端模型列表只有 `gpt-6-*` / `daybreak-*` | `model_catalog_json` 没设或文件不存在 → 重跑安装 |
+| CLI 报 `Unknown model deepseek-v4.1-flash` | `wb.config.toml` 没引用 `workbuddy-catalog.json` → 重跑 `setup.py install` |
 | `--profile wb cannot be used ... legacy [profiles.wb]` | profile 写进了 `config.toml`，应放 `wb.config.toml` |
 | 一直「正在重新连接 N/N」 | 看错误里的 url。多半是**上游/中转的错**（例：中转返回 402 无有效订单），不是网络 |
 | `exceeded retry limit, last status: 429` | 上游边缘限流，见上文。放慢节奏，别同时跑桌面端 agent |

@@ -3,7 +3,7 @@
 
 [model_providers.workbuddy]
 name = "WorkBuddy"
-base_url = "http://127.0.0.1:8787/v1"
+base_url = "http://localhost:8787/v1"
 # 本地代理不校验密钥，占位即可（真正的登录态在代理里）
 experimental_bearer_token = "workbuddy-local"
 wire_api = "responses"

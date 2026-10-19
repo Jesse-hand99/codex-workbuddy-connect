@@ -10,10 +10,20 @@ rem 几处刻意的写法，别改：
 rem   1) 本文件必须保持 GBK(cp936)：UTF-8 中文在 936 代码页下会吞掉换行、拆散语句。
 rem   2) curl/ping 用 %SystemRoot% 全路径：否则 PATH 里的 git-bash 版会抢先匹配；
  rem      等待用 ping 而非 timeout.exe：timeout 在 stdin 被重定向时会直接报错。
-rem   3) 全篇不用 ( ) 块包 set：括号内的 %VAR% 在解析期就展开，块内刚 set 的值取不到。
+rem   3) 含 %VAR% 的 set 不放进 ( ) 块：括号内的 %VAR% 在解析期就展开。
 rem   4) codex 优先 npm 全局：PATH 里可能有别的 codex 抢先（例如 Hermes 自带的那份
 rem      与 WorkBuddy 不兼容）。要强制指定就设 CODEX_WB_CODEX。
 setlocal
+if not defined WB_KEEP_PROXY (
+    set "HTTP_PROXY="
+    set "HTTPS_PROXY="
+    set "ALL_PROXY="
+    set "http_proxy="
+    set "https_proxy="
+    set "all_proxy="
+    set "NO_PROXY=127.0.0.1,localhost,::1"
+    set "no_proxy=127.0.0.1,localhost,::1"
+)
 call "%~dp0_findpy.cmd"
 if not defined PYEXE (
     echo [wb] 找不到 python 解释器。请安装 Python 3.10+，或设置 WORKBUDDY_AI_PYTHON。

@@ -33,6 +33,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import wbdiscover
@@ -206,6 +207,29 @@ def log_err(*a):
     print("[wbproxy]", *a, file=sys.stderr, flush=True)
 
 
+def configure_upstream_network() -> None:
+    """Ignore inherited proxy variables for the loopback-to-WorkBuddy hop.
+
+    The Codex process and this proxy can inherit a dead local proxy
+    (`HTTP_PROXY=http://127.0.0.1:9` in the measured environment). urllib
+    would then route the upstream request through it and fail before reaching
+    WorkBuddy. `WB_KEEP_PROXY=1` preserves the old behavior for environments
+    that genuinely require an outbound proxy.
+    """
+    if os.environ.get("WB_KEEP_PROXY") == "1":
+        return
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        os.environ.pop(key, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+    urllib.request.install_opener(
+        urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    )
+
+
 # ─────────────────────── 凭据：解密与刷新 ───────────────────────
 
 def _aad(key_id: str, suite: int) -> bytes:
@@ -326,10 +350,16 @@ class Credentials:
             "X-Product": "SaaS",
         }
 
-    def chat_headers(self) -> dict:
+    def account_headers(self) -> dict:
+        """Authenticated JSON headers shared by quota and other account APIs."""
         h = self._common()
         h["Content-Type"] = "application/json"
         h["Authorization"] = "Bearer " + self.access_token
+        return h
+
+    def chat_headers(self) -> dict:
+        h = self.account_headers()
+        h.update(conversation_headers())
         return h
 
     def expired(self) -> bool:
@@ -392,7 +422,7 @@ class Credentials:
         body = json.dumps({"PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca"}).encode()
         req = urllib.request.Request(
             GLOBAL_BASE + "/v2/billing/meter/get-user-resource",
-            data=body, headers=self.chat_headers(), method="POST",
+            data=body, headers=self.account_headers(), method="POST",
         )
         with urllib.request.urlopen(req, timeout=45) as r:
             d = json.loads(r.read().decode("utf-8", "replace"))
@@ -416,6 +446,21 @@ class Credentials:
 # ─────────────────────────── 上游转发 ───────────────────────────
 
 CHAT_PATH = "/v2/chat/completions"
+
+
+def conversation_headers() -> dict:
+    """Fresh channel identifiers required by the WorkBuddy chat gateway.
+
+    Since 2026-10-16 the international endpoint rejects chat requests that
+    omit all three headers with HTTP 400 / code 11128. The upstream does not
+    key conversation history by these ids, so fresh UUIDs per request are the
+    measured behavior (also used by dsh-workbuddy-connect).
+    """
+    return {
+        "X-Conversation-ID": str(uuid.uuid4()),
+        "X-Conversation-Request-ID": str(uuid.uuid4()),
+        "X-Conversation-Message-ID": str(uuid.uuid4()),
+    }
 
 
 def _prepare_payload(payload: dict) -> dict:
@@ -734,6 +779,7 @@ class Handler(BaseHTTPRequestHandler):
             self._err(e.status, e.detail)
             return
         except Exception as e:
+            log_err(f"代理内部错误（chat）: {type(e).__name__}: {str(e)[:300]}")
             self._err(502, f"{type(e).__name__}: {e}")
             return
 
@@ -824,6 +870,7 @@ class Handler(BaseHTTPRequestHandler):
             self._err(e.status, e.detail)
             return
         except Exception as e:
+            log_err(f"代理内部错误（responses）: {type(e).__name__}: {str(e)[:300]}")
             self._err(502, f"{type(e).__name__}: {e}")
             return
 
@@ -858,6 +905,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     global _VERBOSE
     wbdiscover.console_encodings()
+    configure_upstream_network()
     ap = argparse.ArgumentParser(description="WorkBuddy AI → OpenAI 兼容本地代理")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)

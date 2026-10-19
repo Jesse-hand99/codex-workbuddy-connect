@@ -196,10 +196,12 @@ curl -s http://127.0.0.1:8787/wb/last-model
 3. 看护说「未激活」→ 在 Codex 里启用插件（`config.toml` 的 `[plugins."…"] enabled`）
 4. 起不来 → `doctor.cmd`，看是缺桌面端、缺凭据、还是缺 cryptography
 5. 起来了但报错 → 看日志 `%TEMP%\wbproxy.log`
-6. 报 429 → 等 1 分钟或换模型
-7. 桌面端看不到 WorkBuddy 模型 → 模型目录 `model_catalog.json` 没生成对，重跑 `install.cmd`
-8. 桌面端旧会话不跟随 → **新建会话**
-9. 想让「新会话自动起代理」也生效 → 按上文**信任 hook**
+6. 报 `11128 / 请求被拦截` → 确认插件是 1.5.5+，并重启代理。1.5.4 缺少上游要求的三个 `X-Conversation-*` 头
+7. 本地 provider 报 `502 Bad Gateway` → 进程继承了失效的 `HTTP(S)_PROXY`。用 `codex-wb.cmd`，或先清除代理变量
+8. 报 429 → 等 1 分钟或换模型
+9. CLI 报 `Unknown model` 或桌面端看不到 WorkBuddy 模型 → 确认 `wb.config.toml` 的 `model_catalog_json` 指向 `workbuddy-catalog.json`，重跑 `install.cmd`
+10. 桌面端旧会话不跟随 → **新建会话**
+11. 想让「新会话自动起代理」也生效 → 按上文**信任 hook**
 
 ## 合规
 

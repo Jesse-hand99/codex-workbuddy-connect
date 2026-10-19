@@ -3,6 +3,12 @@
 把 **WorkBuddy AI 桌面端**已登录的模型接进 **Codex**（CLI 与桌面端）——不需要 OpenAI 订阅，
 也不需要 Codex 套餐。打完包就是一个标准的 **Codex plugin marketplace** 仓库。
 
+> **1.5.5：** 修复 WorkBuddy 上游的 `11128` 渠道校验（三个 `X-Conversation-*` 头），
+> 并把 `workbuddy-catalog.json` 显式绑定到 `wb` profile。启动脚本默认绕开失效的
+> `HTTP(S)_PROXY`；需要企业代理时设 `WB_KEEP_PROXY=1`。
+>
+> 版本说明与验收记录：[README_v1.5.5.md](README_v1.5.5.md)。
+
 ```
 Codex ──► 127.0.0.1:8787（本地代理）──► workbuddy.ai ──► 真实模型
            │  解密桌面端登录态
@@ -69,7 +75,7 @@ codex-workbuddy-connect/
 | **Windows** | — | 依赖 `%LOCALAPPDATA%`、直接调 `.exe`，非跨平台 |
 | **WorkBuddy AI 桌面端** | 已安装**且已登录** | 凭据来源。**不需要常驻运行** |
 | **Python** | 3.10+，含 `cryptography` | 用于 AES-256-GCM 解密 |
-| **Codex** | 0.153.x（已验证） | 0.16x 的 unified-exec helper 在本机会失败，别盲目升 |
+| **Codex** | 0.163.0-alpha.10.2（本机端到端验证） | 0.153+ 均可走 Responses；旧 0.16x 的 helper 问题已不适用于本机 0.163 |
 
 缺什么先跑 `doctor.cmd` —— 它会逐项告诉你，并给出补法。
 
@@ -138,6 +144,17 @@ codex --profile wb                          新会话走 WorkBuddy
 ```
 
 桌面端（Codex app）同理，但**必须新建会话**：provider 与模型是**逐会话绑定**的。
+
+桌面端如果已经运行，必须先**完全退出**；否则它会复用现有单实例，不读取启动参数。
+从 PowerShell 启动一个带 WorkBuddy 覆盖配置的桌面端：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File `
+  "<插件>\scripts\start-codex-app-wb.ps1" `
+  D:\your-workspace
+```
+
+然后在桌面端**新建聊天**。该启动器不会改动全局默认 provider。
 
 **免费档**（实测 0 积分）：`hy3`、`deepseek-v4.1-flash`、`step-5-preview`。
 ⚠ `hy4-preview` 名字像免费但**收费**（0.02）。

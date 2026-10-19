@@ -6,3 +6,4 @@
 model_provider = "workbuddy"
 model = "deepseek-v4.1-flash"     # 免费档；hy3 / step-5-preview 同样免费
 model_reasoning_effort = "low"
+model_catalog_json = "<CODEX_HOME>/workbuddy-catalog.json"
