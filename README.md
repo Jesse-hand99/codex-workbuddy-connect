@@ -126,6 +126,9 @@ codex plugin marketplace add DuuU525/codex-workbuddy-connect
 codex plugin add codex-workbuddy-connect@workbuddy
 ```
 
+> 想改代码、调试代理或让 Codex 直接读本地源码，用源码挂载模式：
+> [install.md](install.md)（mount-local.ps1 + Junction）。
+
 装插件后还需要执行一次安装器，写入 provider、profile 和模型目录：
 
 ```cmd
@@ -325,6 +328,9 @@ hook 内容变化后需要重新信任。看护状态与手动控制：
 codex-workbuddy-connect/
 ├─ .agents/plugins/marketplace.json
 ├─ README.md
+├─ PUBLISHING.md
+├─ install.md                  从源码本地安装（挂载模式，开发用）
+├─ mount-local.ps1             注册本地 marketplace + Junction 挂载
 ├─ docs/workbuddy-codex-validation.md
 └─ plugins/codex-workbuddy-connect/
    ├─ .codex-plugin/plugin.json

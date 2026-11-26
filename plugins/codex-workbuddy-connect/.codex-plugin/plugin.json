@@ -1,6 +1,6 @@
 {
   "name": "codex-workbuddy-connect",
-  "version": "1.7.4-20261119091313",
+  "version": "1.7.5",
   "description": "把 WorkBuddy AI（国际版）与 WorkBuddy（国内版）桌面端已登录的模型同时接进 Codex（CLI 与桌面端）；查看两区账号昵称与剩余积分；结构化诊断流中断与上游 502。",
   "author": {
     "name": "Charlotte Lee"

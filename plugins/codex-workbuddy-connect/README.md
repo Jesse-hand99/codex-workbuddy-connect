@@ -1,6 +1,6 @@
 # codex-workbuddy-connect
 
-> **未发布：终止事件 usage 补全（2026-11-19）**
+> **1.7.5：终止事件 usage 补全（2026-11-19）**
 >
 > - 修复上游建连/HTTP 失败时，代理伪造的 `response.completed` 里 `usage` 是空字典，
 >   导致 Codex 报 `stream disconnected before completion: failed to parse
