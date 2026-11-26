@@ -20,6 +20,10 @@ Hermes 的 venv 里 `Scripts\\python.exe` 只有 ~45KB，是 **uv 的 launcher �
 
 另外：只用 `DETACHED_PROCESS`（`0x8`），**不要与 `CREATE_NO_WINDOW` 按位或** ——
 两者语义冲突，而且真正的问题在存根转发，加那个标志不解决。
+
+前台辅助命令（PowerShell、netstat、tasklist 等）走 `run_hidden`：父进程可能是
+`pythonw.exe`，这时子进程默认会新建可见控制台；`CREATE_NO_WINDOW` 配合
+`STARTUPINFO` 可让这类短命令完全不闪窗。
 """
 from __future__ import annotations
 
@@ -27,12 +31,32 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 #: 新进程不继承父控制台，也不随父进程退出而终止。
 DETACHED_PROCESS = 0x00000008
 
 #: 后台进程的默认日志（各调用点通常会自己指定更贴合用途的日志）。
 DEFAULT_LOG = Path(tempfile.gettempdir()) / "wbproxy_launch.log"
+
+#: Windows 前台辅助进程不创建/继承控制台窗口。
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+STARTF_USESHOWWINDOW = getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+
+
+def run_hidden(*args: Any, **kwargs: Any):
+    """Run a short helper command without flashing a Windows console.
+
+    For synchronous helpers such as PowerShell/WMI/netstat. Long-lived detached
+    proxies continue to use :func:`spawn_detached`.
+    """
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        kwargs.setdefault("startupinfo", startupinfo)
+        kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
+    return subprocess.run(*args, **kwargs)
 
 
 def no_console_python() -> str:

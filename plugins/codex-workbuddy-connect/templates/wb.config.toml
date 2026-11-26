@@ -4,6 +4,8 @@
 # 用法：codex --profile wb
 
 model_provider = "workbuddy"
-model = "deepseek-v4.1-flash"     # 免费档；hy3 / step-5-preview 同样免费
+# 选择器里的 slug 带区域前缀：ai/... = 国际版，cn/... = 国内版。
+# 不带前缀的旧写法（如 deepseek-v4.1-flash）仍按国际版处理。
+model = "cn/deepseek-v4.1-flash"     # 免费档；cn/hy4free、cn/hy3 同样免费
 model_reasoning_effort = "low"
 model_catalog_json = "<CODEX_HOME>/workbuddy-catalog.json"

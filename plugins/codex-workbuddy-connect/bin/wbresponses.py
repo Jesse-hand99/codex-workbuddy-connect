@@ -246,6 +246,16 @@ def _usage_to_responses(usage: dict) -> dict:
     return out
 
 
+def empty_usage() -> dict:
+    """零值 usage。
+
+    Responses 协议把 usage 当作必填结构体，input_tokens / output_tokens /
+    total_tokens 都必须存在。给空字典会让 Codex 在解析 response.completed 时
+    抛 `missing field input_tokens`，把真正的上游错误盖掉。
+    """
+    return _usage_to_responses({})
+
+
 def stream_responses_events(chat_events: Iterable[dict], model: str) -> Iterable[dict]:
     """Chat 增量事件流 → Responses 事件流（含 event 名）。
 
@@ -409,4 +419,4 @@ def aggregate_response(chat_events: list[dict], model: str) -> dict:
         if name == "response.completed":
             final = ev["response"]
     return final or {"id": _new_id("resp"), "object": "response", "status": "completed",
-                     "model": model, "output": [], "usage": {}}
+                     "model": model, "output": [], "usage": empty_usage()}

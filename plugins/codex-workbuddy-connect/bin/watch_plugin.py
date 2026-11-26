@@ -21,14 +21,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 import wbspawn
 import socket
-import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -130,7 +131,8 @@ def is_active(cfg: Path | None = None) -> tuple[bool, str]:
 # ── 代理进程：识别、启动、停止 ───────────────────────────────
 def _netstat_pids(p: int) -> list[str]:
     try:
-        out = subprocess.run(["netstat", "-ano"], capture_output=True, timeout=60).stdout
+        out = wbspawn.run_hidden(["netstat", "-ano"],
+                           capture_output=True, timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     pids = []
@@ -145,8 +147,9 @@ def _netstat_pids(p: int) -> list[str]:
 def _exe_args(pid: str) -> str:
     ps = (f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine")
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, timeout=60)
+        r = wbspawn.run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                               "-Command", ps],
+                              capture_output=True, timeout=60)
         return r.stdout.decode("utf-8", "replace").strip()
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -159,6 +162,20 @@ def proxy_running(p: int | None = None) -> tuple[bool, str]:
             return True, "端口在监听"
     except OSError:
         return False, "端口未监听"
+
+
+def proxy_health(p: int | None = None) -> tuple[bool, str]:
+    """Validate the listener, not merely the TCP port."""
+    p = p or port()
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{p}/health", timeout=2) as response:
+            doc = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception as e:
+        return False, f"/health 不可用（{type(e).__name__}）"
+    if not isinstance(doc, dict) or doc.get("provider") not in ("workbuddy", "workbuddy-ai"):
+        return False, "端口由其它程序占用或返回了非本插件健康信息"
+    return True, f"健康（version={doc.get('version') or '?'}, pid={doc.get('pid') or '?'}）"
 
 
 def our_pids(p: int | None = None) -> list[str]:
@@ -186,7 +203,7 @@ def start_proxy(p: int | None = None) -> bool:
         return False
     for _ in range(40):
         time.sleep(0.5)
-        if proxy_running(p)[0]:
+        if proxy_health(p)[0]:
             log_err(f"代理已启动 → http://127.0.0.1:{p}/v1")
             return True
     log_err(f"代理启动后 20 秒仍未就绪（日志 {logf}）")
@@ -200,7 +217,8 @@ def stop_proxy(p: int | None = None) -> bool:
         return False
     for pid in pids:
         try:
-            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=60)
+            wbspawn.run_hidden(["taskkill", "/F", "/PID", pid],
+                              capture_output=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as e:
             log_err(f"结束进程 {pid} 失败：{e}")
     deadline = time.time() + 10
@@ -216,13 +234,13 @@ def stop_proxy(p: int | None = None) -> bool:
 # ── 单实例 ───────────────────────────────────────────────────
 def _pid_alive(pid: int) -> bool:
     try:
-        subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                       capture_output=True, timeout=30)
+        wbspawn.run_hidden(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                          capture_output=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return False
     try:
-        r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                           capture_output=True, timeout=30)
+        r = wbspawn.run_hidden(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                              capture_output=True, timeout=30)
         return str(pid) in r.stdout.decode("cp936", "replace")
     except (OSError, subprocess.SubprocessError):
         return False
@@ -263,12 +281,26 @@ def reconcile(cfg: Path | None = None, p: int | None = None, quiet: bool = False
     p = p or port()
     active, why = is_active(cfg)
     running, _ = proxy_running(p)
+    healthy, health_why = proxy_health(p) if running else (False, "端口未监听")
 
     if active and not running:
         if not quiet:
             log_err(f"插件激活但代理没跑（{why}）→ 启动代理")
         start_proxy(p)
         return "started"
+    if active and running and not healthy:
+        pids = our_pids(p)
+        if pids:
+            log_err(
+                f"本插件代理不健康（{health_why}，PID {', '.join(pids)}）"
+                " → 重启代理"
+            )
+            if stop_proxy(p):
+                start_proxy(p)
+            return "restarted"
+        if not quiet:
+            log_err(f"端口 {p} 不健康（{health_why}），但不是本插件进程；不终止")
+        return "unhealthy-port"
     if not active and running:
         pids = our_pids(p)
         if not pids:
@@ -285,9 +317,11 @@ def show_status(cfg: Path | None = None, p: int | None = None) -> int:
     p = p or port()
     active, why = is_active(cfg)
     running, rwhy = proxy_running(p)
+    healthy, health_why = proxy_health(p) if running else (False, "端口未监听")
     pids = our_pids(p) if running else []
     print(f"  插件激活 : {active}   （{why}）")
     print(f"  代理运行 : {running} （{rwhy}）")
+    print(f"  代理健康 : {healthy} （{health_why}）")
     if pids:
         print(f"  本包代理 PID : {', '.join(pids)}")
     print(f"  期望状态 : {'代理应在跑' if active else '代理应停止'}"

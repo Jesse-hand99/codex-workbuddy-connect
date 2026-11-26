@@ -7,10 +7,13 @@
   3. 生成 $CODEX_HOME/workbuddy-catalog.json（模型切换列表的数据源）
   4. 安装 query-current-model 技能，并可选地在 AGENTS.md 里加一条「现查当前模型」规则
 
+两个 WorkBuddy 区域（国际版 / 国内版）共用一个代理与一个模型目录；安装时会先停掉
+本插件遗留的旧代理进程，避免多个进程同时监听 8787。
+
 用法：
     python setup.py install      [--no-skill] [--no-agents-rule] [--port 8787]
     python setup.py uninstall    [--yes]
-    python setup.py status
+    python setup.py status [--json]
 """
 from __future__ import annotations
 
@@ -20,14 +23,15 @@ import os
 import re
 import shutil
 import socket
-import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wbspawn  # noqa: E402  （无控制台启动）
 import wbdiscover  # noqa: E402
+import wbsettings  # noqa: E402
 from wbdiscover import console_encodings  # noqa: E402
 
 HERE = Path(__file__).resolve().parent          # .../bin
@@ -39,17 +43,19 @@ MARK_END = "<!-- END codex-workbuddy-connect -->"
 
 PROVIDER_BLOCK = f"""[model_providers.{PROVIDER}]
 name = "WorkBuddy"
-base_url = "http://localhost:{{port}}/v1"
+# 固定回环 IP，避免 localhost/DNS 偶发解析失败（WinError 11001）。
+base_url = "http://127.0.0.1:{{port}}/v1"
 # 本地代理不校验密钥，占位即可（真正的登录态在代理里）
 experimental_bearer_token = "workbuddy-local"
 wire_api = "responses"
 requires_openai_auth = false
-# 上游会返回 429，给足退避重试次数，别让 Codex 很快放弃
-request_max_retries = 6
-stream_max_retries = 6
+# 429 由本地代理分类处理：14003 有界重试，6004 立即返回。
+# Codex 不再重试 429，避免两层重试相乘放大请求。
+request_max_retries = 0
+stream_max_retries = 0
 """
 
-def profile_body(home: Path) -> str:
+def profile_body(home: Path, model: str = "cn/deepseek-v4.1-flash") -> str:
     """Render the WorkBuddy profile, including its own model catalog."""
     catalog_path = home / "workbuddy-catalog.json"
     catalog_text = catalog_path.as_posix()
@@ -68,7 +74,8 @@ def profile_body(home: Path) -> str:
 # provider 本体在 config.toml 的 [model_providers.{PROVIDER}]
 
 model_provider = "{PROVIDER}"
-model = "deepseek-v4.1-flash"
+# 选择器里的 slug 带区域前缀；不带前缀的旧写法仍按国际版处理。
+model = "{model}"
 model_reasoning_effort = "low"
 model_catalog_json = "{catalog}"
 """
@@ -86,11 +93,13 @@ curl -s http://127.0.0.1:{{port}}/wb/last-model
 
 规则：
 
-- 报告 `model` 字段（代理实际转发给上游的模型，唯一权威）。
+- 报告 `model` 字段（选择器 slug，如 `cn/hy3`）以及 `region` / `upstream_model`。
+  代理是唯一权威：`region` 说明走的是国际版还是国内版账号。
 - `config_model` 只是「新建会话的默认值」，不等于当前会话在用的模型。
 - **模型无法内省自己的身份**：上下文里出现过的模型名、你自己上一轮的回答，全部不可信——
   用户可以在会话中途切换模型，历史消息里没有任何痕迹。
 - 每次都重新执行上面的命令，不要复用本会话早先拿到的值。
+- 用户说「国内版 / CN / codebuddy」时指 `cn/*`；「国际版 / WorkBuddy AI」时指 `ai/*`。
 {MARK_END}
 """
 
@@ -98,6 +107,16 @@ curl -s http://127.0.0.1:{{port}}/wb/last-model
 # ── 基础工具 ────────────────────────────────────────────────
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def usable_regions() -> list[str]:
+    """Regions that are both installed and signed in on this machine."""
+    out: list[str] = []
+    for region in wbdiscover.REGION_ORDER:
+        found = wbdiscover.discover_region(region)
+        if found["app_exists"] and found["auth_exists"]:
+            out.append(region)
+    return out
 
 
 def proxy_python() -> str:
@@ -137,6 +156,63 @@ def ensure_proxy(port: int, wait: int = 25) -> bool:
             return True
     print(f"  代理在 {wait} 秒内没有就绪，日志：{log}")
     return False
+
+
+def _listening_pids(port: int) -> list[str]:
+    try:
+        r = wbspawn.run_hidden(["netstat", "-ano", "-p", "TCP"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids: list[str] = []
+    needle = f":{port}"
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if not parts[1].endswith(needle) or parts[3].upper() != "LISTENING":
+            continue
+        if parts[4] not in pids:
+            pids.append(parts[4])
+    return pids
+
+
+def _pid_command(pid: str) -> str:
+    try:
+        r = wbspawn.run_hidden(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+            capture_output=True, text=True, timeout=30)
+        return (r.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
+def stop_stale_proxies(port: int) -> list[str]:
+    """Stop every wbproxy listener on the port, whatever install path it uses.
+
+    Codex caches plugins by version and the watcher may still be running an
+    older copy. Two proxies on one port split requests between accounts, so an
+    upgrade stops all of them before the new one starts. Only processes whose
+    command line actually names ``wbproxy`` are touched.
+    """
+    stopped: list[str] = []
+    for pid in _listening_pids(port):
+        cmd = _pid_command(pid)
+        if "wbproxy" not in cmd.lower():
+            continue
+        try:
+            wbspawn.run_hidden(["taskkill", "/F", "/PID", pid],
+                              capture_output=True, timeout=30)
+            stopped.append(pid)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if stopped:
+        for _ in range(20):
+            if not port_open(port):
+                break
+            time.sleep(0.25)
+    return stopped
 
 
 def backup(path: Path) -> Path | None:
@@ -220,18 +296,27 @@ def step_provider(home: Path, port: int) -> Path | None:
 
 def step_profile(home: Path) -> Path | None:
     prof = home / f"{PROFILE_NAME}.config.toml"
+    model = "cn/deepseek-v4.1-flash"
     if prof.is_file():
         bak = backup(prof)
+        # Reinstalling must not silently reset a model the user picked.
+        m = re.search(r'^model\s*=\s*"([^"]+)"', read_text_keep(prof), re.M)
+        if m:
+            model = m.group(1)
+            # Older profiles used a bare international id. Keep the user's
+            # choice, but make it explicit so the selector and logs agree.
+            if not model.startswith(("ai/", "cn/")):
+                model = "ai/" + model
         print(f"  已存在 {prof.name}" + (f"，备份：{bak.name}" if bak else ""))
-    write_text_keep(prof, to_newline(profile_body(home), "\r\n"))
-    print(f"  已写入 profile：{prof.name}（用法：codex --profile {PROFILE_NAME}）")
+    write_text_keep(prof, to_newline(profile_body(home, model), "\r\n"))
+    print(f"  已写入 profile：{prof.name}（默认模型 {model}；用法：codex --profile {PROFILE_NAME}）")
     return prof
 
 
 def step_catalog(home: Path, port: int) -> Path | None:
     out = home / "workbuddy-catalog.json"
     gen = HERE / "gen-catalog.py"
-    r = subprocess.run([proxy_python(), str(gen), "--port", str(port), "--out", str(out), "--quiet"],
+    r = wbspawn.run_hidden([proxy_python(), str(gen), "--port", str(port), "--out", str(out), "--quiet"],
                        capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         print(f"  生成目录失败：{(r.stderr or r.stdout).strip()[:300]}")
@@ -285,7 +370,7 @@ def step_watch(enable: bool) -> None:
     pyw = Path(exe).with_name("pythonw.exe")
     runner = str(pyw) if pyw.is_file() else exe
     action = "install-autostart" if enable else "remove-autostart"
-    r = subprocess.run([exe, str(watcher), f"--{action}"],
+    r = wbspawn.run_hidden([exe, str(watcher), f"--{action}"],
                        capture_output=True, text=True, errors="replace")
     out = (r.stdout or "").strip()
     if r.returncode != 0:
@@ -307,9 +392,16 @@ def step_models_note(port: int) -> None:
         print(f"  （读不到模型列表：{e}）")
         return
     ids = [m.get("id") for m in (doc.get("data") or []) if m.get("id")]
-    free = {"hy3", "step-5-preview", "deepseek-v4.1-flash"}
-    print(f"  可用模型 {len(ids)} 个；实测免费档：{', '.join(sorted(free))}")
-    print(f"  改用默认模型：编辑 {codex_home() / (PROFILE_NAME + '.config.toml')} 的 model = \"...\"")
+    ai = [x for x in ids if str(x).startswith("ai/")]
+    cn = [x for x in ids if str(x).startswith("cn/")]
+    print(f"  可用模型 {len(ids)} 个（国际 {len(ai)} / 国内 {len(cn)}）")
+    hidden = wbsettings.hidden_regions()
+    for region in wbdiscover.REGION_ORDER:
+        if region in hidden:
+            print(f"  {wbdiscover.REGIONS[region].label}目前在设置里隐藏，不进入选择器"
+                  f"（恢复：scripts\\wb-model.cmd show {region}）")
+    print("  列表与 WorkBuddy 桌面端一致（档位快捷项「快速/均衡/极致」不进选择器）")
+    print("  切换全局 provider/默认：scripts\\wb-model.cmd use cn/deepseek-v4.1-flash")
 
 
 # ── 命令 ────────────────────────────────────────────────────
@@ -324,16 +416,24 @@ def cmd_install(args) -> int:
         bad = [c for c in wbdiscover.diagnose(args.port) if not c[1]]
         for name, ok, detail in wbdiscover.diagnose(args.port):
             print(f"  [{'OK ' if ok else '!! '}] {name}: {detail}")
-        # 代理没在跑不算致命（下一步会拉起）；其它失败要先解决
-        fatal = [c for c in bad if "端口" not in c[0]]
+        # 代理没在跑不算致命（下一步会拉起）。两个区域任一可用即可安装；
+        # 只有工具链缺失，或两个区域都不可用时才阻断。
+        fatal = [c for c in bad if "端口" not in c[0] and "国际版" not in c[0] and "国内版" not in c[0]]
+        if not usable_regions():
+            print("\n  需要至少一个 WorkBuddy 桌面端已安装并登录（国际版或国内版均可）。")
+            if not args.force:
+                return 1
         if fatal:
             print("\n  上面标 !! 的项需要先解决。修好后重跑 install.cmd。")
             if not args.force:
                 return 1
 
     print("\n[1/6] 确保本地代理可用（生成目录需要它）")
+    stopped = stop_stale_proxies(args.port)
+    if stopped:
+        print(f"  已停止旧代理进程：{', '.join(stopped)}（避免多进程抢占同一端口）")
     if not ensure_proxy(args.port):
-        print("  代理不可用。请先启动并登录 WorkBuddy AI 桌面端，再重试。")
+        print("  代理不可用。请先启动并登录任意一个 WorkBuddy 桌面端（国际版或国内版），再重试。")
         return 1
     print("  OK")
 
@@ -368,7 +468,7 @@ def cmd_install(args) -> int:
     print(f"  {PKG_ROOT / 'scripts' / 'codex-wb.cmd'}                 # TUI（自动拉起代理）")
     print(f"  {PKG_ROOT / 'scripts' / 'codex-wb.cmd'} exec \"任务\"      # 非交互")
     print(f"  codex --profile {PROFILE_NAME}                            # 已装 Codex 时")
-    print(f"  powershell -File {PKG_ROOT / 'scripts' / 'start-codex-app-wb.ps1'} [工作区]  # 桌面端")
+    print(f"  {PKG_ROOT / 'scripts' / 'start-codex-app-wb.cmd'} [工作区]  # 桌面端（先完全退出 Codex）")
     print("\n注意：桌面端切换模型不会写回 config.toml，代理会自动同步；")
     print("      旧的会话记住自己创建时的模型，改用「新聊天」才走新默认值。")
     return 0
@@ -377,6 +477,7 @@ def cmd_install(args) -> int:
 def cmd_uninstall(args) -> int:
     home = codex_home()
     print(f"从 {home} 卸载")
+    stop_stale_proxies(args.port)
     cfg = home / "config.toml"
     if cfg.is_file():
         bak = backup(cfg)
@@ -426,32 +527,93 @@ def cmd_doctor(args) -> int:
     for name, ok, detail in rows:
         print(f"  [{'OK ' if ok else '!! '}] {name:<{width}}  {detail}")
 
-    bad = [r for r in rows if not r[1] and "端口" not in r[0]]
+    bad = [r for r in rows if not r[1] and "端口" not in r[0]
+           and "国际版" not in r[0] and "国内版" not in r[0]]
     print()
+    if not usable_regions():
+        print("需要处理：至少需要一个 WorkBuddy 桌面端已安装并登录（国际版或国内版均可）。")
+        return 1
     if bad:
         print("需要处理：")
         for name, _, _ in bad:
             tip = {
-                "Python ≥3.10": "装 Python 3.10+（安装时勾选 Add python.exe to PATH），或设 WORKBUDDY_AI_PYTHON",
+                "Python >=3.10": "装 Python 3.10+（安装时勾选 Add python.exe to PATH），或设 WORKBUDDY_AI_PYTHON",
                 "cryptography": '用上一步的 python 执行：python -m pip install cryptography',
-                "WorkBuddy 桌面端": "装 WorkBuddy AI 桌面端（国际版）并登录；或用 WORKBUDDY_AI_APP 指定路径",
-                "登录凭据": "启动桌面端并完成登录，凭据会自动写出",
+                "WorkBuddy 国际版": "装 WorkBuddy AI 桌面端并登录；或用 WORKBUDDY_AI_APP 指定路径",
+                "国际版登录凭据": "启动国际版并完成登录，凭据会自动写出；或用 WORKBUDDY_AI_AUTH_FILE 指定",
+                "WorkBuddy 国内版": "装 WorkBuddy 桌面端并登录；或用 WORKBUDDY_CN_APP 指定路径（不装也能只用国际版）",
+                "国内版登录凭据": "启动国内版并完成登录；或用 WORKBUDDY_CN_AUTH_FILE 指定",
                 "Codex CLI": "npm i -g @openai/codex，或用 CODEX_WB_CODEX 指定",
             }.get(name, "")
             if tip:
                 print(f"  - {name}：{tip}")
         return 1
+    optional = [r for r in rows if not r[1] and ("国际版" in r[0] or "国内版" in r[0])]
+    if optional:
+        print("可选：未就绪的区域不会出现在选择器里；登录后重跑 install.cmd 即可加入。")
     print("环境就绪，可以运行 install.cmd")
     return 0
 
 
-def cmd_status(args) -> int:
-    home = codex_home()
+def fetch_account_status(port: int) -> dict[str, dict]:
+    """Ask the proxy for both regions' account + credit summary.
+
+    Missing proxy is not an install failure: it returns one unavailable entry
+    per region so `status` stays a diagnostic, not a gate.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/wb/account-status", timeout=60
+        ) as r:
+            document = json.loads(r.read().decode("utf-8", "replace"))
+        regions = document.get("regions")
+        if isinstance(regions, dict):
+            return dict(regions)
+    except Exception as e:
+        if port_open(port):
+            detail = "当前运行的代理没有 /wb/account-status 端点；重跑 install.cmd 重启代理后再查"
+        else:
+            detail = f"代理未就绪：{type(e).__name__}: {e}"
+        return {
+            region: {
+                "region": region,
+                "label": wbdiscover.REGIONS[region].label,
+                "available": False,
+                "nickname": None,
+                "display_name": None,
+                "uid_tail": None,
+                "enterprise_id": None,
+                "credits": None,
+                "error": detail,
+            }
+            for region in wbdiscover.REGION_ORDER
+        }
+    return {}
+
+
+def fetch_last_model(port: int) -> dict | None:
+    """The proxy's last forwarded model; None when it cannot answer."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/wb/last-model", timeout=10
+        ) as r:
+            document = json.loads(r.read().decode("utf-8", "replace"))
+        return document if isinstance(document, dict) else None
+    except Exception:
+        return None
+
+
+def status_install_section(home: Path) -> dict:
+    """The install self-check as data, printed by the text renderer."""
     cfg = home / "config.toml"
     text = read_text_keep(cfg) if cfg.is_file() else ""
     prof = home / f"{PROFILE_NAME}.config.toml"
     profile_text = read_text_keep(prof) if prof.is_file() else ""
     catalog_file = home / "workbuddy-catalog.json"
+    provider_match = re.search(r'^model_provider\s*=\s*"([^"]+)"', text, re.M)
+    global_catalog_match = re.search(r'^model_catalog_json\s*=\s*"([^"]+)"', text, re.M)
+    global_provider = provider_match.group(1) if provider_match else None
+    global_catalog = global_catalog_match.group(1) if global_catalog_match else None
     catalog_slugs: set[str] = set()
     if catalog_file.is_file():
         try:
@@ -464,30 +626,134 @@ def cmd_status(args) -> int:
             catalog_slugs = set()
     model_match = re.search(r'^model\s*=\s*"([^"]+)"', profile_text, re.M)
     profile_model = model_match.group(1) if model_match else None
-    catalog_linked = catalog_file.resolve().as_posix() in profile_text.replace("\\", "/")
-    catalog_has_model = profile_model in catalog_slugs if profile_model else False
-    print(f"CODEX_HOME          : {home}")
-    print(f"provider 段已安装    : {f'[model_providers.{PROVIDER}]' in text}")
-    print(f"profile 文件        : {prof.is_file()}")
-    print(f"模型目录            : {catalog_file.is_file()}")
-    print(f"profile 引用目录    : {catalog_linked}")
-    print(f"目录含 profile 模型 : {catalog_has_model} ({profile_model})")
-    print(f"技能                : {(home / 'skills' / 'query-current-model').is_dir()}")
-    ag = home / "AGENTS.md"
-    print(f"AGENTS.md 规则      : {ag.is_file() and MARK_BEGIN in read_text_keep(ag)}")
-    print(f"代理 {args.port} 在跑 : {port_open(args.port)}")
+    counts: dict[str, int] = {}
+    for slug in catalog_slugs:
+        region = "cn" if slug.startswith("cn/") else "ai" if slug.startswith("ai/") else None
+        if region is not None:
+            counts[region] = counts.get(region, 0) + 1
     startup = (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
                / "Start Menu" / "Programs" / "Startup" / "codex-workbuddy-connect-watch.vbs")
-    print(f"代理看护自启   : {startup.is_file()}")
-    if port_open(args.port):
-        import urllib.request
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/wb/last-model", timeout=10) as r:
-                d = json.loads(r.read().decode("utf-8", "replace"))
-            print(f"  实际在用模型      : {d.get('model')}")
-            print(f"  配置默认          : {d.get('config_model')} (synced={d.get('config_synced')})")
-        except Exception as e:
-            print(f"  （查询失败：{e}）")
+    ag = home / "AGENTS.md"
+    return {
+        "codex_home": str(home),
+        "provider_installed": f"[model_providers.{PROVIDER}]" in text,
+        "global_provider": global_provider,
+        "global_catalog": global_catalog,
+        "profile_file": prof.is_file(),
+        "catalog_file": catalog_file.is_file(),
+        "catalog_linked": catalog_file.resolve().as_posix() in profile_text.replace("\\", "/"),
+        "catalog_has_profile_model": profile_model in catalog_slugs if profile_model else False,
+        "profile_model": profile_model,
+        "skill_installed": (home / "skills" / "query-current-model").is_dir(),
+        "agents_rule": ag.is_file() and MARK_BEGIN in read_text_keep(ag),
+        "catalog_models": counts,
+        "hidden_regions": sorted(wbsettings.hidden_regions()),
+        "watch_autostart": startup.is_file(),
+    }
+
+
+def build_status_document(home: Path, port: int) -> dict:
+    """Stable machine-readable status: install + regions + last_model."""
+    return {
+        "install": status_install_section(home),
+        "regions": fetch_account_status(port),
+        "last_model": fetch_last_model(port),
+    }
+
+
+def display_number(value) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+
+def display_time(value) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(value)))
+    except (TypeError, ValueError, OSError):
+        return "-"
+
+
+def render_account_section(regions: dict[str, dict]) -> list[str]:
+    """Text view of both regions; failures are labelled, never zeroed."""
+    lines = ["", "账号与积分"]
+    for region in wbdiscover.REGION_ORDER:
+        item = regions.get(region) or {}
+        label = item.get("label") or wbdiscover.REGIONS[region].label
+        if not item.get("available"):
+            lines.append(f"  {label:<6}: 不可用 — {item.get('error') or '未登录'}")
+            continue
+        name = item.get("display_name") or "未知账号"
+        line = f"  {label:<6}: {name}"
+        if item.get("enterprise_id"):
+            line += f"（企业 {item['enterprise_id']}）"
+        lines.append(line)
+        credits = item.get("credits")
+        if not isinstance(credits, dict):
+            lines.append(f"          积分：读取失败 — {item.get('error') or '未知原因'}")
+        elif credits.get("unlimited") is True:
+            lines.append("          积分：企业额度 · 不限")
+        elif credits.get("remaining") is None or credits.get("total") is None:
+            lines.append("          积分：尚未读取")
+        else:
+            lines.append(
+                f"          积分：剩余 {display_number(credits['remaining'])}"
+                f" / {display_number(credits['total'])}"
+            )
+        reset = (credits.get("cycleResetTime") if isinstance(credits, dict) else None) \
+            or item.get("cycleResetTime")
+        if reset:
+            lines.append(f"          周期重置：{reset}")
+        if item.get("token_expires_at"):
+            lines.append(f"          令牌有效期至：{display_time(item['token_expires_at'])}")
+        if item.get("read_at"):
+            lines.append(f"          读取时间：{display_time(item['read_at'])}")
+    return lines
+
+
+def render_status_text(document: dict, port: int) -> str:
+    install = document["install"]
+    lines = [
+        f"CODEX_HOME          : {install['codex_home']}",
+        f"provider 段已安装    : {install['provider_installed']}",
+        f"全局 provider        : {install['global_provider']}",
+        f"全局模型目录        : {install['global_catalog']}",
+        f"profile 文件        : {install['profile_file']}",
+        f"模型目录            : {install['catalog_file']}",
+        f"profile 引用目录    : {install['catalog_linked']}",
+        f"目录含 profile 模型 : {install['catalog_has_profile_model']} ({install['profile_model']})",
+        f"技能                : {install['skill_installed']}",
+        f"AGENTS.md 规则      : {install['agents_rule']}",
+        f"代理 {port} 在跑 : {port_open(port)}",
+    ]
+    for region in wbdiscover.REGION_ORDER:
+        d = wbdiscover.discover_region(region)
+        lines.append(f"{d['label']:<6} 桌面端/凭据 : {d['app_exists']}/{d['auth_exists']}  {d['app'] or '-'}")
+        lines.append(f"{'':<6} 目录模型数   : {install['catalog_models'].get(region, 0)}")
+    hidden = install.get("hidden_regions") or []
+    lines.append("隐藏的区域          : " + (", ".join(hidden) if hidden else "无"))
+    lines.append(f"代理看护自启   : {install['watch_autostart']}")
+    last = document.get("last_model")
+    if isinstance(last, dict):
+        lines.append(f"  实际在用模型      : {last.get('model')}  (区域={last.get('region')}，上游={last.get('upstream_model')})")
+        lines.append(f"  配置默认          : {last.get('config_model')} (synced={last.get('config_synced')})")
+    lines.extend(render_account_section(document["regions"]))
+    return "\n".join(lines)
+
+
+def cmd_status(args) -> int:
+    home = codex_home()
+    document = build_status_document(home, args.port)
+    if getattr(args, "json", False):
+        print(json.dumps(document, ensure_ascii=False, indent=2))
+    else:
+        print(render_status_text(document, args.port))
+    # A signed-out or unreadable region is a diagnosable state, not an
+    # install failure; status stays 0 so scripts do not treat it as fatal.
     return 0
 
 
@@ -509,7 +775,8 @@ def main() -> int:
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_uninstall)
 
-    p = sub.add_parser("status", help="查看安装状态与实际在用模型")
+    p = sub.add_parser("status", help="查看安装状态、账号积分与实际在用模型")
+    p.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("doctor", help="环境体检（不安装任何东西）")

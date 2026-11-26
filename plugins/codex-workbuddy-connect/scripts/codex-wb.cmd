@@ -4,7 +4,8 @@ rem
 rem 用法与 codex 相同：
 rem     codex-wb.cmd                     交互式 TUI
 rem     codex-wb.cmd exec "重构 utils.py"
-rem     codex-wb.cmd -m hy3              换模型（hy3 / deepseek-v4.1-flash 免费）
+rem     codex-wb.cmd -m cn/hy3           换模型（ai/ 国际版，cn/ 国内版）
+rem     codex-wb.cmd -m cn/hy4free       ??????cn/hy4free??cn/hy3??cn/deepseek-v4.1-flash
 rem
 rem 几处刻意的写法，别改：
 rem   1) 本文件必须保持 GBK(cp936)：UTF-8 中文在 936 代码页下会吞掉换行、拆散语句。

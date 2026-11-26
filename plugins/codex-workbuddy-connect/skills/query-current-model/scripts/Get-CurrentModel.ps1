@@ -74,10 +74,12 @@ function Get-LiveModel {
                 try { $when = (Get-Date -UnixTimeSeconds $r.ts).ToString('HH:mm:ss') } catch { $when = $null }
             }
             return [pscustomobject]@{
-                model = $r.model
-                ts    = $r.ts
-                count = $r.count
-                when  = $when
+                model    = $r.model
+                region   = $r.region
+                upstream = $r.upstream_model
+                ts       = $r.ts
+                count    = $r.count
+                when     = $when
             }
         }
     } catch { }
@@ -122,16 +124,20 @@ $result = [ordered]@{
 }
 
 if ($live) {
-    $result.effective_model   = $live.model
-    $result.effective_source  = 'proxy-observed'
-    $result.last_request_time = $live.when
-    $result.requests_observed = $live.count
+    $result.effective_model    = $live.model
+    $result.effective_region   = $live.region
+    $result.effective_upstream = $live.upstream
+    $result.effective_source   = 'proxy-observed'
+    $result.last_request_time  = $live.when
+    $result.requests_observed  = $live.count
     if ($live.model -ne $modelSlug) {
         $result.config_default_mismatch = $true
         $result.note = "Session switched to '$($live.model)'; config.toml '$modelSlug' is only the default for new sessions."
     }
 } else {
     $result.effective_model  = $modelSlug
+    $result.effective_region = if ($modelSlug -like 'cn/*') { 'cn' } elseif ($modelSlug -like 'ai/*') { 'ai' } else { 'ai (legacy alias)' }
+    $result.effective_upstream = if ($modelSlug -like 'cn/*' -or $modelSlug -like 'ai/*') { $modelSlug.Substring(3) } else { $modelSlug }
     $result.effective_source = 'config-only (proxy down or no request yet)'
 }
 
@@ -167,6 +173,7 @@ if ($Json) {
     $result | ConvertTo-Json -Compress
 } else {
     Write-Host "In use now : $($result.effective_display_name)  (slug: $effSlug)"
+    Write-Host "  region           : $($result.effective_region)   upstream: $($result.effective_upstream)"
     Write-Host "  source           : $($result.effective_source)"
     if ($result.last_request_time) {
         Write-Host "  last request     : $($result.last_request_time)  (request #$($result.requests_observed) seen by proxy)"

@@ -3,6 +3,12 @@
 让这个包能在**任意机器**上跑起来：WorkBuddy 桌面端装在哪、凭据文件叫什么、
 Python 和 Codex 在不在 PATH 里，一律自动找，不写死。
 
+两个 WorkBuddy 产品共用一套客户端框架，安装路径、可执行文件名与凭据文件名
+各不相同，因此这里按「区域」建模：
+
+  - ``ai``：WorkBuddy AI（国际版）  WorkBuddyAI.exe / workbuddy-desktop-ai.info
+  - ``cn``：WorkBuddy（国内版）      WorkBuddy.exe   / workbuddy-desktop.info
+
 所有发现函数都遵循同一优先级：**环境变量覆盖 > 自动探测**。
 """
 from __future__ import annotations
@@ -11,19 +17,106 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
+import wbspawn
+
 # ── 环境变量名（同时被 wbproxy / setup / 启动脚本读取）──
-ENV_APP = "WORKBUDDY_AI_APP"
+ENV_APP = "WORKBUDDY_AI_APP"                 # 国际版（历史名称，保持兼容）
 ENV_AUTH = "WORKBUDDY_AI_AUTH_FILE"
+ENV_CN_APP = "WORKBUDDY_CN_APP"
+ENV_CN_AUTH = "WORKBUDDY_CN_AUTH_FILE"
 ENV_PYTHON = "WORKBUDDY_AI_PYTHON"
 ENV_CODEX = "CODEX_WB_CODEX"
 
-APP_EXE_NAMES = ("WorkBuddyAI.exe", "CodeBuddy.exe", "WorkBuddy.exe")
-APP_DIR_NAMES = ("WorkBuddyAI", "WorkBuddy AI", "CodeBuddy", "CodeBuddyAI")
+REGION_AI = "ai"
+REGION_CN = "cn"
 
-# 凭据文件名：国际版优先，国内版兜底（两者可能同时存在，且属于不同账号）
-AUTH_NAMES = ("workbuddy-desktop-ai.info", "workbuddy-desktop.info")
+
+@dataclass(frozen=True)
+class RegionSpec:
+    """One WorkBuddy product's on-disk identity."""
+
+    id: str
+    label: str                    # 国际版 / 国内版
+    app_env: str
+    auth_env: str
+    app_exe: str
+    app_dir_names: tuple[str, ...]
+    display_pattern: str          # 卸载项 DisplayName 的正则
+    auth_name: str
+    default_domain: str
+
+
+REGIONS: dict[str, RegionSpec] = {
+    REGION_AI: RegionSpec(
+        id=REGION_AI,
+        label="国际版",
+        app_env=ENV_APP,
+        auth_env=ENV_AUTH,
+        app_exe="WorkBuddyAI.exe",
+        app_dir_names=("WorkBuddyAI", "WorkBuddy AI", "CodeBuddyAI"),
+        display_pattern=r"^WorkBuddy AI(?:\s|$)",
+        auth_name="workbuddy-desktop-ai.info",
+        default_domain="www.workbuddy.ai",
+    ),
+    REGION_CN: RegionSpec(
+        id=REGION_CN,
+        label="国内版",
+        app_env=ENV_CN_APP,
+        auth_env=ENV_CN_AUTH,
+        app_exe="WorkBuddy.exe",
+        app_dir_names=("WorkBuddy", "CodeBuddy"),
+        display_pattern=r"^WorkBuddy(?!\s+AI)(?:\s|$)",
+        auth_name="workbuddy-desktop.info",
+        default_domain="www.codebuddy.cn",
+    ),
+}
+
+REGION_ORDER = (REGION_AI, REGION_CN)
+
+# 桌面端路径不会几秒变一次；缓存自动发现结果，避免 /health 的 5 秒轮询反复
+# 启动 PowerShell 查卸载注册表。环境变量覆盖仍每次即时生效。
+DISCOVERY_TTL_SEC = 300.0
+_DISCOVERY_CACHE: dict[tuple[str, object], tuple[float, object]] = {}
+_DISCOVERY_LOCK = threading.Lock()
+
+
+def _env_fingerprint() -> tuple:
+    return tuple((name, os.environ.get(name)) for name in (
+        ENV_APP, ENV_AUTH, ENV_CN_APP, ENV_CN_AUTH, ENV_PYTHON, ENV_CODEX,
+        "LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramFiles(x86)",
+        "ProgramW6432",
+    ))
+
+
+def _cached_discovery(key: str, region: str, producer):
+    cache_key = (key, region, _env_fingerprint())
+    now = time.monotonic()
+    with _DISCOVERY_LOCK:
+        hit = _DISCOVERY_CACHE.get(cache_key)
+        if hit and now - float(hit[0]) < DISCOVERY_TTL_SEC:
+            return hit[1]
+    value = producer(region)
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE[cache_key] = (time.monotonic(), value)
+    return value
+
+
+def clear_discovery_cache() -> None:
+    """Drop cached path lookups (tests and explicit refresh points)."""
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_CACHE.clear()
+
+
+
+# 兼容旧调用方（只描述国际版时代的常量）
+APP_EXE_NAMES = tuple(spec.app_exe for spec in REGIONS.values())
+APP_DIR_NAMES = tuple(d for spec in REGIONS.values() for d in spec.app_dir_names)
+AUTH_NAMES = tuple(spec.auth_name for spec in REGIONS.values())
 
 
 def _env(name: str) -> str | None:
@@ -59,10 +152,10 @@ def console_encodings() -> None:
 
 
 # ── WorkBuddy 桌面端可执行文件 ──────────────────────────────
-def _app_from_registry() -> str | None:
-    """NSIS 安装会写卸载项，UninstallString 里的目录就是安装目录。"""
+def _uninstall_entries() -> list[tuple[str, str]]:
+    """返回 [(DisplayName, UninstallString)]，最多 16 条。"""
     if sys.platform != "win32":
-        return None
+        return []
     ps = (
         "$ErrorActionPreference='SilentlyContinue';"
         "$p=@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',"
@@ -70,48 +163,79 @@ def _app_from_registry() -> str | None:
         "'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*');"
         "Get-ItemProperty $p | "
         "Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | "
-        "Select-Object -First 4 -ExpandProperty UninstallString"
+        "Select-Object -First 16 DisplayName,UninstallString | "
+        "ForEach-Object { $_.DisplayName + \"`t\" + $_.UninstallString }"
     )
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, timeout=60)
+        r = wbspawn.run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                               "-Command", ps],
+                              capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
-        return None
+        return []
+    out: list[tuple[str, str]] = []
     for line in r.stdout.decode("utf-8", "replace").splitlines():
-        line = line.strip().strip('"')
-        if not line:
+        if "\t" not in line:
             continue
-        # 形如  "D:\...\WorkBuddyAI\Uninstall WorkBuddyAI.exe" /currentuser
-        path = line.split('"')[0] if line.startswith('"') else line
-        path = path.split(" /")[0].strip().strip('"')
-        d = Path(path).parent
-        for exe in APP_EXE_NAMES:
-            cand = d / exe
+        name, uninstall = line.split("\t", 1)
+        out.append((name.strip(), uninstall.strip()))
+    return out
+
+
+def _exe_from_uninstall(uninstall: str, spec: RegionSpec) -> str | None:
+    line = uninstall.strip().strip('"')
+    if not line:
+        return None
+    # 形如  "D:\...\WorkBuddyAI\Uninstall WorkBuddyAI.exe" /currentuser
+    path = line.split('"')[0] if line.startswith('"') else line
+    path = path.split(" /")[0].strip().strip('"')
+    d = Path(path).parent
+    for exe in (spec.app_exe, "WorkBuddy.exe", "WorkBuddyAI.exe", "CodeBuddy.exe"):
+        cand = d / exe
+        try:
             if cand.is_file():
                 return str(cand)
+        except OSError:
+            continue
     return None
 
 
-def _app_from_process() -> str | None:
+def _app_from_registry(spec: RegionSpec) -> str | None:
+    """NSIS 安装会写卸载项，按 DisplayName 精确区分两个产品。"""
+    import re
+    pattern = re.compile(spec.display_pattern, re.I)
+    for name, uninstall in _uninstall_entries():
+        if not pattern.search(name):
+            continue
+        got = _exe_from_uninstall(uninstall, spec)
+        if got:
+            return got
+    return None
+
+
+def _app_from_process(spec: RegionSpec) -> str | None:
     """桌面端正在跑的话，直接问它。"""
     if sys.platform != "win32":
         return None
-    names = "' or name='".join(n.replace(".exe", ".exe") for n in APP_EXE_NAMES)
+    name = spec.app_exe
     try:
-        r = subprocess.run(
-            ["wmic", "process", "where", f"name='{names}'",
+        r = wbspawn.run_hidden(
+            ["wmic", "process", "where", f"name='{name}'",
              "get", "ExecutablePath", "/format:csv"],
             capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     for line in r.stdout.decode("utf-8", "replace").splitlines():
         parts = [p.strip() for p in line.split(",") if p.strip()]
-        if parts and parts[-1].lower().endswith(".exe") and Path(parts[-1]).is_file():
-            return parts[-1]
+        if parts and parts[-1].lower().endswith(name.lower()):
+            try:
+                if Path(parts[-1]).is_file():
+                    return parts[-1]
+            except OSError:
+                continue
     return None
 
 
-def _app_from_common_paths() -> str | None:
+def _app_from_common_paths(spec: RegionSpec) -> str | None:
     roots = [
         os.environ.get("LOCALAPPDATA"),
         os.environ.get("APPDATA"),
@@ -123,41 +247,59 @@ def _app_from_common_paths() -> str | None:
     for root in roots:
         if not root:
             continue
-        for d in APP_DIR_NAMES:
+        for d in spec.app_dir_names:
             for sub in ("Programs", ""):
                 base = Path(root) / sub / d if sub else Path(root) / d
                 if base not in seen:
                     seen.append(base)
     # 非系统盘上的同名目录（很多人装到 D:）
     for drive in "CDEFGH":
-        for d in APP_DIR_NAMES:
+        for d in spec.app_dir_names:
             seen.append(Path(f"{drive}:/Programs/{d}"))
             seen.append(Path(f"{drive}:/Program Files/{d}"))
     for base in seen:
-        for exe in APP_EXE_NAMES:
-            cand = base / exe
-            try:
-                if cand.is_file():
-                    return str(cand)
-            except OSError:
-                continue
+        cand = base / spec.app_exe
+        try:
+            if cand.is_file():
+                return str(cand)
+        except OSError:
+            continue
     return None
 
 
-def find_app() -> str | None:
-    """返回 WorkBuddy 桌面端主程序路径；找不到返回 None。
+def find_app(region: str = REGION_AI) -> str | None:
+    """返回指定区域桌面端主程序路径；找不到返回 None。
 
-    显式设置了 WORKBUDDY_AI_APP 就原样采信（哪怕路径不存在）——这样写错路径时
+    显式设置了该区域的环境变量就原样采信（哪怕路径不存在）——这样写错路径时
     体检会如实报「找不到」，而不是悄悄回退到自动发现、让人以为配置生效了。
+    自动发现结果按 TTL 缓存，避免高频 /health 反复拉起 PowerShell。
     """
-    override = _env(ENV_APP)
+    spec = REGIONS[region]
+    override = _env(spec.app_env)
     if override:
         return override
-    for probe in (_app_from_registry, _app_from_process, _app_from_common_paths):
-        got = probe()
-        if got:
-            return got
-    return None
+
+    def _discover(_region: str):
+        for probe in (_app_from_registry, _app_from_process, _app_from_common_paths):
+            got = probe(REGIONS[_region])
+            if got:
+                return got
+        return None
+
+    return _cached_discovery("app", region, _discover)
+
+
+def app_version(region: str = REGION_AI) -> str | None:
+    """读取桌面端安装目录里的 version 文件。"""
+    app = find_app(region)
+    if not app:
+        return None
+    try:
+        v = Path(app).parent / "version"
+        text = v.read_text(encoding="utf-8").strip()
+        return text or None
+    except OSError:
+        return None
 
 
 # ── 凭据文件 ────────────────────────────────────────────────
@@ -174,30 +316,62 @@ def _auth_dirs() -> list[Path]:
 def find_auth_files() -> list[str]:
     """列出所有可用的凭据文件（国际版在前）。"""
     found: list[str] = []
-    for d in _auth_dirs():
-        for name in AUTH_NAMES:
-            p = d / name
+    for spec in (REGIONS[r] for r in REGION_ORDER):
+        for d in _auth_dirs():
+            p = d / spec.auth_name
             try:
                 if p.is_file() and p.stat().st_size > 0:
                     found.append(str(p))
+                    break
             except OSError:
                 continue
     return found
 
 
-def find_auth_file() -> str | None:
-    override = _env(ENV_AUTH)
+def find_auth_file(region: str = REGION_AI) -> str | None:
+    spec = REGIONS[region]
+    override = _env(spec.auth_env)
     if override:
         return override
-    files = find_auth_files()
-    return files[0] if files else None
+
+    def _discover(_region: str):
+        for d in _auth_dirs():
+            p = d / REGIONS[_region].auth_name
+            try:
+                if p.is_file() and p.stat().st_size > 0:
+                    return str(p)
+            except OSError:
+                continue
+        return None
+
+    return _cached_discovery("auth", region, _discover)
+
+
+def discover_region(region: str) -> dict:
+    """One region's paths and presence, for diagnostics and startup."""
+    spec = REGIONS[region]
+    app = find_app(region)
+    auth = find_auth_file(region)
+    return {
+        "id": region,
+        "label": spec.label,
+        "app": app,
+        "app_exists": bool(app and Path(app).is_file()),
+        "auth": auth,
+        "auth_exists": bool(auth and Path(auth).is_file()),
+        "version": app_version(region),
+        "app_env": spec.app_env,
+        "auth_env": spec.auth_env,
+    }
 
 
 # ── Python 解释器（供 .cmd 启动脚本用）────────────────────
 def _python_candidates() -> list[str]:
     la = os.environ.get("LOCALAPPDATA", "")
     pf = os.environ.get("ProgramFiles", "")
+    local_venv = Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe"
     out = [
+        str(local_venv),
         os.path.join(la, "hermes", "hermes-agent", "venv", "Scripts", "python.exe"),
         os.path.join(la, "Programs", "Python", "Python313", "python.exe"),
         os.path.join(la, "Programs", "Python", "Python312", "python.exe"),
@@ -218,20 +392,23 @@ def find_python() -> str | None:
         return override
     cands = [c for c in _python_candidates() if Path(c).is_file()]
     # PATH 上的 python / py
-    for name in ("python.exe", "python3.exe"):
+    for name in ("python.exe", "python", "py"):
         p = shutil.which(name)
-        if p:
+        if p and Path(p).is_file():
             cands.append(p)
-    # 优先挑能 import cryptography 的
-    for c in cands:
-        if _has_crypto(c):
-            return c
+    seen: set[str] = set()
+    for cand in cands:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if has_crypto(cand)[0]:
+            return cand
     return cands[0] if cands else None
 
 
 def _has_crypto(python: str) -> bool:
     try:
-        r = subprocess.run([python, "-c", "import cryptography; print(cryptography.__version__)"],
+        r = wbspawn.run_hidden([python, "-c", "import cryptography; print(cryptography.__version__)"],
                            capture_output=True, timeout=60)
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -241,7 +418,7 @@ def _has_crypto(python: str) -> bool:
 def has_crypto(python: str) -> tuple[bool, str]:
     """返回 (是否有 cryptography, 版本或错误)。"""
     try:
-        r = subprocess.run([python, "-c",
+        r = wbspawn.run_hidden([python, "-c",
                             "import sys, cryptography; "
                             "print(f'{sys.version_info.major}.{sys.version_info.minor}|{cryptography.__version__}')"],
                            capture_output=True, timeout=60)
@@ -291,22 +468,26 @@ def diagnose(port: int = 8787) -> list[tuple[str, bool, str]]:
             ver_ok = (major, minor) >= (3, 10)
         except ValueError:
             ver_ok = False
-        out.append(("Python ≥3.10", ver_ok, py if ver_ok else f"{py}（版本 {ver} 偏低）"))
-        out.append((f"cryptography", ok, info if ok else f"缺失 —— {info}"))
+        out.append(("Python >=3.10", ver_ok, py if ver_ok else f"{py}（版本 {ver} 偏低）"))
+        out.append(("cryptography", ok, info if ok else f"缺失 —— {info}"))
     else:
-        out.append(("Python ≥3.10", False, "找不到 python，请安装 Python 3.10+ 并勾选 Add to PATH"))
+        out.append(("Python >=3.10", False, "找不到 python，请安装 Python 3.10+ 并勾选 Add to PATH"))
         out.append(("cryptography", False, "跳过（没有 python）"))
 
-    # WorkBuddy 桌面端
-    app = find_app()
-    out.append(("WorkBuddy 桌面端", bool(app), app or "找不到，请先安装 WorkBuddy AI 桌面端（国际版）"))
-
-    # 凭据
-    auths = find_auth_files()
-    if auths:
-        out.append(("登录凭据", True, auths[0] + (f"（另有 {len(auths)-1} 份备用）" if len(auths) > 1 else "")))
-    else:
-        out.append(("登录凭据", False, "找不到凭据文件，请先启动 WorkBuddy 桌面端并登录"))
+    # WorkBuddy 桌面端与凭据：每个区域各一行
+    for region in REGION_ORDER:
+        spec = REGIONS[region]
+        found = discover_region(region)
+        out.append((
+            f"WorkBuddy {spec.label}",
+            found["app_exists"],
+            found["app"] or f"找不到；安装 {spec.label} 桌面端，或设置 {spec.app_env}",
+        ))
+        out.append((
+            f"{spec.label}登录凭据",
+            found["auth_exists"],
+            found["auth"] or f"找不到；先启动 {spec.label} 桌面端并登录，或设置 {spec.auth_env}",
+        ))
 
     # Codex
     cx = find_codex()
@@ -316,8 +497,7 @@ def diagnose(port: int = 8787) -> list[tuple[str, bool, str]]:
     try:
         import socket
         with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            busy = "已被占用（可能是本代理已在跑）"
-            out.append((f"端口 {port}", True, busy))
+            out.append((f"端口 {port}", True, "已被占用（可能是本代理已在跑）"))
     except OSError:
         out.append((f"端口 {port}", True, "空闲"))
 
@@ -329,14 +509,15 @@ def main() -> int:
     console_encodings()
     ap = argparse.ArgumentParser(description="路径与运行时自动发现")
     ap.add_argument("what", nargs="?", default="all",
-                    choices=["app", "auth", "python", "codex", "all", "doctor"])
+                    choices=["app", "auth", "python", "codex", "all", "doctor", "regions"])
+    ap.add_argument("--region", choices=list(REGIONS), default=REGION_AI)
     ap.add_argument("--port", type=int, default=8787)
     a = ap.parse_args()
 
     if a.what == "app":
-        print(find_app() or "")
+        print(find_app(a.region) or "")
     elif a.what == "auth":
-        print(find_auth_file() or "")
+        print(find_auth_file(a.region) or "")
     elif a.what == "python":
         print(find_python() or "")
     elif a.what == "codex":
@@ -345,11 +526,16 @@ def main() -> int:
         width = max(len(n) for n, _, _ in diagnose(a.port))
         for name, ok, detail in diagnose(a.port):
             print(f"  [{'OK ' if ok else '!! '}] {name:<{width}}  {detail}")
+    elif a.what == "regions":
+        import json
+        print(json.dumps({r: discover_region(r) for r in REGION_ORDER},
+                         ensure_ascii=False, indent=1))
     else:
-        print(f"app    : {find_app()}")
-        print(f"auth   : {find_auth_file()}")
         print(f"python : {find_python()}")
         print(f"codex  : {find_codex()}")
+        for region in REGION_ORDER:
+            d = discover_region(region)
+            print(f"{region:<7}: app={d['app']} auth={d['auth']}")
     return 0
 
 

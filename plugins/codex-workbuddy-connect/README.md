@@ -1,27 +1,107 @@
 # codex-workbuddy-connect
 
-> **1.5.5 修复（2026-10-20）**
+> **未发布：终止事件 usage 补全（2026-11-19）**
 >
-> - 补上上游 `2026-10-16` 起要求的 `X-Conversation-ID` /
->   `X-Conversation-Request-ID` / `X-Conversation-Message-ID`，修复
->   `400 code 11128 / 请求被拦截`。
-> - `wb.config.toml` 现在显式引用自己的 `workbuddy-catalog.json`，不再回退到
->   全局 DeepSeek 模型目录。
-> - `codex-wb.cmd` / `start-wbproxy.cmd` 默认忽略失效的 `HTTP(S)_PROXY`；
->   确需企业代理时设置 `WB_KEEP_PROXY=1`。
+> - 修复上游建连/HTTP 失败时，代理伪造的 `response.completed` 里 `usage` 是空字典，
+>   导致 Codex 报 `stream disconnected before completion: failed to parse
+>   ResponseCompleted: missing field input_tokens`、把真正的上游错误（如
+>   `prompt is too long: 1223456 tokens > 1048576 maximum`）盖掉的问题。
+> - 新增 `wbresponses.empty_usage()`；终止事件与非流式兜底统一返回带
+>   `input_tokens` / `output_tokens` / `total_tokens` 的零值 usage。
+> - `/health` 的 `version` 改为从 `.codex-plugin/plugin.json` 读取，避免与清单不一致。
 
-把 **WorkBuddy AI 桌面端**已登录的模型，变成 **Codex（CLI / 桌面端）**的模型源。
+> **1.7.4：避免跨 provider 污染全局模型（2026-11-14）**
+>
+> - 代理只有在配置顶层 `model_provider = "workbuddy"` 时才同步该文件的 `model`。
+>   若全局 provider 是 `custom` 等其它值，只同步 `wb.config.toml`，不会造成
+>   `provider=custom + model=cn/...` 的不匹配状态。
+> - `/wb/last-model` 新增 `config_provider`；`config_synced` 同时校验 provider 与 model。
+
+> **1.7.3：回环地址与健康探活补强（2026-11-14）**
+>
+> - provider 的本地地址由 `localhost` 固定为 `127.0.0.1`，避免 Windows 上偶发
+>   `11001 getaddrinfo failed` 导致 Codex 报 `502 Bad Gateway`。
+> - SessionStart 与看护从“端口能连”升级为“`/health` 返回本插件身份”。端口仍被
+>   僵死旧代理占用时，看护只重启命令行可确认属于本插件的进程，不会误杀其它程序。
+> - 上游 Chat SSE 若在没有 `finish_reason` / `[DONE]` 的情况下干净 EOF，现会明确
+>   产生 `response.failed` + `response.completed`，诊断 verdict 为
+>   `upstream_closed_without_terminal_frame`，不再把截断答案伪装成正常完成。
+> - 网络抖动仍无法从公网链路中彻底消灭；本次修复保证本机 `localhost` 解析、
+>   端口僵死和截断终止这三类问题可避免或可准确识别。
+
+> **1.7.2：流中断结构化诊断与终止事件兜底（2026-11-10）**
+>
+> - 每次 `/v1/responses` 与 `/v1/chat/completions` 记录 `request_start` / `upstream_open` /
+>   `upstream_error` / `stream_end`：`%USERPROFILE%\.codex\workbuddy-connect\wbproxy_events.jsonl`。
+> - 记录 `saw_done`、`finish_reason`、`unparsed_data_frames`、`response_completed_emitted`、
+>   错误 `side` / `category`、耗时和**脱敏**的 SSE 帧形状；不写提示词、工具参数或令牌。
+> - `GET /wb/stream-diagnostics?limit=200` 直接给逐请求 verdict；`/health` 增加
+>   `stream_diagnostics` 摘要。
+> - 上游 `10054` / `11001` / `10060` / TLS EOF 等建连故障先做有界重试，再返回
+>   `upstream_transport_error`（明确 `side=upstream`），不再把原始 `URLError` 伪装成本地 502。
+> - 上游 SSE 中途断开或 Responses 转换异常时，补发 `response.failed` +
+>   `response.completed`，避免 Codex 报 `stream closed before response.completed`。
+>
+> **2026-11-08 实测更新：按实时目录收敛模型**
+>
+> - 2026-11-08 从运行中的代理重新读取两区目录：国内版 17 个模型（新增 `cn/hy4free`、
+>   `cn/hy4std`、`cn/kimi-k3.1-pro`；`cn/glm-5.1`、`cn/glm-5v-turbo`、`cn/minimax-m3`、
+>   `cn/kimi-k2.6`、`cn/kimi-k2.7` 已不在 CLI 名单）。
+> - 国际版上游目前不可用（`available: false`），已从选择器隐藏。隐藏不是登出：
+>   用 `wb-model.cmd hide ai` / `show ai` 控制，状态在
+>   `%USERPROFILE%\.codex\workbuddy-settings.json` 的 `hidden_regions`。
+> - 隐藏只影响 `/v1/models` 与 `workbuddy-catalog.json`；`/health` 与
+>   `/wb/account-status` 仍报告该区账号。显式请求被隐藏的区域会返回
+>   `region_unavailable`，**不会跨区回退**。
+> - 实测费率：`cn/hy4free`、`cn/hy3`、`cn/deepseek-v4.1-flash` 为 0 扣分；
+>   `cn/step-5-preview` **已改为 0.02**（此前记为免费）。
+>
+> **1.7.5：选择器与桌面端对齐（2026-11-24）**
+>
+> - 显示名不再统一加 `（国内）` / `（国际）` 后缀，与 WorkBuddy 桌面端选择器一致；
+>   只有两区真的同名时才补区域后缀。
+> - 剔除档位快捷项：`fast-model` / `balanced-model` / `primary-model` / `deep-model`
+>   （桌面端的「快速 / 均衡 / 极致」）不进入 Codex 选择器；出图、出视频的模型同样排除。
+> - `/v1/models` 与代理启动时会按当前 roster 重写 `workbuddy-catalog.json`，
+>   上游下线旧模型（例如 Hy3）后选择器不会再挂着它。
+>
+> **1.7.0：账号与积分状态（2026-10-21）**
+>
+> - 新增 `GET /wb/account-status`：按区域返回账号昵称（缺失时回退 UID 尾号）、
+>   剩余 / 总积分、令牌有效期与读取时间；单区失败不影响另一区。
+> - `/workbuddy-status` 与 `status.cmd` 现在直接展示两个区域分别绑定了哪个账号、
+>   各有多少积分；`setup.py status --json` 提供稳定机器可读结构。
+> - 补上国内版企业账号的周期额度读取（`get-enterprise-user-usage`），支持“企业额度 · 不限”。
+> - 积分默认实时读取；`/wb/account-status?refresh=0` 使用进程内 60 秒缓存。
+> - **Codex 宿主不提供** dsh 那样的插件设置卡片或输入框插槽，因此没有改模型选择器，
+>   也不做常驻聊天区 UI；账号与积分统一走状态命令。
+>
+> **1.6.0：双区域支持（2026-10-20）**
+>
+> - 同一个代理、同一个 `8787` 端口同时接入 **WorkBuddy AI（国际版）** 与
+>   **WorkBuddy（国内版）**，两套模型合并进同一个 Codex 模型选择器。
+> - 模型 ID 带区域前缀：`ai/...` 走 `workbuddy.ai`，`cn/...` 走
+>   `copilot.tencent.com`；选中模型即切换区域，不用换端口、profile 或会话。
+> - 不带前缀的旧 ID（如 `deepseek-v4.1-flash`）继续按国际版处理，历史会话不受影响。
+> - 两个区域各自解密自己的登录态；某个区域没登录时只从目录里消失，
+>   **绝不跨区回退**（选 `cn/*` 会明确报 `region_unavailable`）。
+> - 新增 `scripts\wb-model.cmd`：`list` / `current` / `use cn/hy3` / `enable|disable cn`。
+> - 安装器会先停掉所有旧缓存版本的 `wbproxy` 进程，解决多个代理抢同一端口。
+
+把 **WorkBuddy AI（国际版）** 与 **WorkBuddy（国内版）** 桌面端已登录的模型，
+同时变成 **Codex（CLI / 桌面端）**的模型源。选择器里的模型名与 WorkBuddy 桌面端保持一致，
+不额外加 `（国内）` / `（国际）` 后缀（只有两区同名时才补），并随上游名单自动刷新。
 
 不需要 OpenAI 订阅，不需要 Codex 套餐——Codex 只用它的 agent 骨架（读写文件、跑命令、apply_patch、
-多轮工具循环），模型换成 WorkBuddy 的（GPT-6 / GPT-5.6 / GLM / Kimi / Gemini / Grok / Hy3 …），
-其中有 **`hy3`、`deepseek-v4.1-flash`、`step-5-preview` 三个实测 0 扣分**的免费档。
+多轮工具循环），模型换成 WorkBuddy 的（Hy4 / DeepSeek / GLM / Kimi / MiniMax / MiMo …），
+其中有 **`hy4flash-free`、`deepseek-v4.1-flash` 两个 0 扣分**的免费档。
 
 ```
-Codex ──► 127.0.0.1:8787（本机代理）──► workbuddy.ai ──► 真实模型
-           │  解密桌面端登录态
+Codex ──► 127.0.0.1:8787（本机代理）──┬─► workbuddy.ai        ──► 国际版模型（ai/*）
+           │  按 ai/ / cn/ 前缀选区域  └─► copilot.tencent.com ──► 国内版模型（cn/*）
+           │  解密两个桌面端登录态（各自独立）
            │  Responses ⇄ Chat Completions 转换
-           │  记录/同步「实际在用」的模型
-           │  生成模型切换列表
+           │  合并模型目录 / 记录并同步「实际在用」的模型
 ```
 
 ---
@@ -237,9 +317,12 @@ codex-workbuddy-connect/
 | 项 | 要求 | 说明 |
 |---|---|---|
 | **Windows** | — | 依赖 `CREATE_NO_WINDOW`、`%LOCALAPPDATA%`、直接调 `.exe`，非跨平台代码 |
-| **WorkBuddy AI 桌面端** | 已安装**且已登录** | 凭据来源。**不需要常驻运行**，装过登录过即可 |
+| **WorkBuddy AI 桌面端** | 可选 | 国际版（`ai/*`）凭据来源。装了就要登录，**不需要常驻运行** |
+| **WorkBuddy 国内版** | 可选 | 国内版（`cn/*`）凭据来源。装了就要登录 |
 | **Python** | 3.10+，含 `cryptography` | 用于 AES-256-GCM 解密。`install.cmd` 会自动挑一个带 `cryptography` 的解释器 |
 | **Codex** | 0.163.0-alpha.10.2（本机已做端到端验证） | 0.153+ 使用 Responses API；旧 0.16x 在本机曾受 unified-exec helper 问题影响 |
+
+> 两个桌面端**至少装一个并登录**；只装一个也能正常使用。
 
 上表四项**全部自动探测**，不需要改任何路径。先跑一次体检可以确认：
 
@@ -250,8 +333,10 @@ doctor.cmd
 ```
   [OK ] Python ≥3.10     C:\...\python.exe
   [OK ] cryptography     3.11|50.0.0
-  [OK ] WorkBuddy 桌面端  D:\...\WorkBuddyAI.exe
-  [OK ] 登录凭据          C:\...\workbuddy-desktop-ai.info（另有 1 份备用）
+  [OK ] WorkBuddy 国际版  D:\...\WorkBuddyAI.exe
+  [OK ] 国际版登录凭据    C:\...\workbuddy-desktop-ai.info
+  [OK ] WorkBuddy 国内版  C:\...\WorkBuddy.exe
+  [OK ] 国内版登录凭据    C:\...\workbuddy-desktop.info
   [OK ] Codex CLI        C:\...\npm\codex.cmd
   [OK ] 端口 8787         空闲
 ```
@@ -283,11 +368,19 @@ install.cmd --no-skill --no-agents-rule
 install.cmd --skip-doctor
 ```
 
-查状态：
+查状态（含账号与积分）：
 
 ```cmd
 status.cmd
+status.cmd --json
 ```
+
+每个区域单独列出昵称（缺昵称时用 UID 后 8 位）与“剩余 / 总额”积分。
+某个区域没登录或余额读不到时只标记该区，命令仍以 0 退出——
+“装了但没登录”是可诊断状态，不是安装失败。
+
+Codex 本身**没有** dsh 那样的插件设置卡片或聊天输入框插槽，因此账号与积分
+只能通过状态命令、`/wb/account-status` 查看，不会出现在模型选择器旁。
 
 ---
 
@@ -303,7 +396,8 @@ GitHub，对方 `codex plugin marketplace add ...` + `codex plugin add codex-wor
 
 收件人要做的事：
 
-1. 装 **WorkBuddy AI 桌面端（国际版）**，登录一次
+1. 装 **WorkBuddy AI 桌面端（国际版）** 或 **WorkBuddy（国内版）**，至少一个，并登录。
+   两个都装就同时出现在选择器里；只装一个也能用
 2. 装 **Python 3.10+**（勾选 Add to PATH），然后
    `python -m pip install cryptography`
 3. 装 **Codex CLI**（`npm i -g @openai/codex`）
@@ -317,13 +411,15 @@ GitHub，对方 `codex plugin marketplace add ...` + `codex plugin add codex-wor
 
 | 变量 | 作用 |
 |---|---|
-| `WORKBUDDY_AI_APP` | `WorkBuddyAI.exe` 全路径 |
-| `WORKBUDDY_AI_AUTH_FILE` | 凭据文件全路径 |
+| `WORKBUDDY_AI_APP` | 国际版 `WorkBuddyAI.exe` 全路径 |
+| `WORKBUDDY_AI_AUTH_FILE` | 国际版凭据文件全路径 |
+| `WORKBUDDY_CN_APP` | 国内版 `WorkBuddy.exe` 全路径 |
+| `WORKBUDDY_CN_AUTH_FILE` | 国内版凭据文件全路径 |
 | `WORKBUDDY_AI_PYTHON` | 指定 python 解释器 |
 | `CODEX_WB_CODEX` | 指定 `codex-wb.cmd` 用哪个 codex |
 
-> 国内版（`workbuddy-desktop.info`，CodeBuddy）与本包的上游地址不同，**未做适配**。
-> 两份凭据同时存在时优先取国际版 `…-ai.info`。`doctor.cmd` 会显示用的是哪一份。
+> 两个区域**各自独立**解析安装目录、版本文件与凭据；未设置时自动探测，互不覆盖。
+> `doctor.cmd` 会分别显示国际版/国内版的路径与登录状态。只装一个也完全可用。
 
 ---
 
@@ -332,9 +428,24 @@ GitHub，对方 `codex plugin marketplace add ...` + `codex plugin add codex-wor
 ```cmd
 scripts\codex-wb.cmd                     交互式 TUI（代理没跑会自动拉起）
 scripts\codex-wb.cmd exec "重构 utils.py"  非交互
-scripts\codex-wb.cmd -m hy3              换模型
+scripts\codex-wb.cmd -m cn/deepseek-v4.1-flash  换国内版模型
+scripts\codex-wb.cmd -m cn/hy4flash-free       免费档
+
+scripts\wb-model.cmd list                列出两个区域的模型
+scripts\wb-model.cmd current             实际在用 + 新建会话默认
+scripts\wb-model.cmd use cn/deepseek-v4.1-flash  切换全局 provider/目录/默认模型
+scripts\wb-model.cmd hide ai             只从选择器隐藏国际版（账号仍可查）
+scripts\wb-model.cmd show ai             恢复国际版
+scripts\wb-model.cmd disable cn          临时停用国内版（重启代理后生效）
+
+在桌面端**模型选择器**里直接选即可：默认两套模型都在，显示名与 WorkBuddy 桌面端一致；
+某区不可用时可 `wb-model.cmd hide ai` 只隐藏该区（`show ai` 恢复）。
 codex --profile wb                       已装 Codex 时直接用
 ```
+
+`wb-model.cmd use <slug>` 会把全局 `config.toml` 的 provider、模型目录和默认模型一起
+切到 WorkBuddy。桌面端必须完全退出后重启，再新建聊天；只调用 `setup.py install`
+不会覆盖你原来的全局 provider。
 
 `codex-wb.cmd` 会默认清空失效的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`。
 如果直接运行 `codex --profile wb` 且本机代理变量被设置，先在 PowerShell 中执行：
@@ -352,12 +463,14 @@ codex --profile wb
 如果桌面端已经启动过，`codex app` 的单实例行为会复用现有进程，命令行
 `-c` 覆盖可能不生效。此时先完全退出桌面端，再从 PowerShell 运行：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start-codex-app-wb.ps1 D:\your-workspace
+```cmd
+.\scripts\start-codex-app-wb.cmd D:\your-workspace
 ```
 
 该脚本只给本次桌面端启动注入 `workbuddy` provider、模型目录和默认模型，
-不修改全局默认 provider。进入后仍需**新建聊天**。
+不修改全局默认 provider。`.cmd` 版本自动使用进程级执行策略绕过；进入后仍需
+**新建聊天**。启动器会自动从 `PATH`、`%LOCALAPPDATA%\OpenAI\Codex\bin` 和
+`%USERPROFILE%\.codex\bin` 查找 `codex.exe`，不要求外部终端已配置 CLI 的 PATH。
 
 ---
 
@@ -365,16 +478,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-codex-app-wb.ps1 D:\you
 
 实测费率（同规模请求，约 2–3 万输入 token）：
 
-| 模型 | 扣分 | 每千输入 | 备注 |
-|---|---|---|---|
-| `hy3` | **0** | 0 | 免费，192k 上下文 / 64k 输出 |
-| `step-5-preview` | **0** | 0 | 免费，300k / 64k |
-| `deepseek-v4.1-flash` | **0** | 0 | **免费，300k / 128k（推荐默认）** |
-| `glm-5.3-flash` | 0.12 | 0.0050 | |
-| `gpt-6-luna` | 0.38 | 0.0127 | |
-| `gpt-6-sol` | 7.51 | 0.2502 | **比 luna 贵 20 倍**，别当默认 |
+2026-11-08 在本机国内版账号上实测（短请求，看响应的 `usage.credit`）：
 
-> ⚠️ `hy4-preview` 名字带 preview 但**收费**（0.02）。**不要凭名字判断免费**，以实测为准。
+| 模型 | 扣分 | 备注 |
+|---|---|---|
+| `cn/hy4flash-free` | **0** | 960k / 64k，限时免费档 |
+| `cn/deepseek-v4.1-flash` | **0** | **1M / 128k（推荐默认）** |
+| `cn/hy4flash-free` | **0** | 960k / 64k，限时免费档（上游 `modelPromotions`） |
+| `cn/hy4flash` | 0.03 | 960k / 64k |
+| `cn/step-5-preview` | 0.02 | 名字带 preview，**已不再免费** |
+| `cn/hy4std` | 0.04 | 目录标价 x0.29 |
+
+> ⚠️ **不要凭名字判断免费**，也不要只看目录标价：以响应里的 `usage.credit` 为准。
+> 目录标价与实扣可能不一致（`hy4std` 标价 0.29，短请求实扣 0.04）。
 
 扣分写在响应的 `usage.credit` 字段；代理把它记到 `%TEMP%\wb_usage.jsonl`，也汇总在
 `GET /wb/credits`（账号剩余积分）。
@@ -385,9 +501,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-codex-app-wb.ps1 D:\you
 
 | 端点 | 用途 |
 |---|---|
-| `GET /health` | 账号 uid、令牌到期、`last_model` / `last_model_ts` / `requests_seen` |
-| `GET /wb/last-model` | **实际在用**的模型（权威）+ 配置里的默认值 + 是否一致 |
-| `GET /wb/credits` | 账号剩余积分 |
+| `GET /health` | 两个区域的 uid/令牌状态（`regions.ai` / `regions.cn`）、`last_model`、`pid`、`version`、`root` |
+| `GET /wb/last-model` | **实际在用**的 `model`（slug）、`region`、`upstream_model` + 配置默认值 + 是否一致 |
+| `GET /wb/credits?region=ai|cn` | 指定区域的账号剩余积分（不传默认国际版） |
+| `GET /wb/stream-diagnostics?limit=200` | 逐请求流中断诊断：verdict、SSE 终止帧、错误类别 |
+| `GET /wb/account-status` | 两区账号 + 积分摘要；`?refresh=0` 用 60 秒进程内缓存 |
 | `GET /v1/models` | 模型目录（同时给 OpenAI 形状 `data` 和 Codex 形状 `models`） |
 | `POST /v1/chat/completions` | OpenAI 兼容（Hermes 等用） |
 | `POST /v1/responses` | Responses API（Codex 0.153+ 唯一支持的形式） |
@@ -403,14 +521,16 @@ Codex 里有两层模型值，**极易误判**：
 
 后果有两个，都已解决：
 
-1. **配置滞后** → 代理每次转发请求时，把顶层 `model` 同步回 `config.toml`（只改那一行，
-   原子替换）。`WB_SYNC_CONFIG=0` 可关。
+1. **配置滞后** → 代理每次转发真实对话/Responses 请求时，把顶层 `model` 同步回
+   `config.toml` 与 `wb.config.toml`（只改那一行，原子替换，保留 CRLF）。探测与目录请求
+   不写配置。`WB_FOLLOW_LAST_MODEL=0` 可关；旧的 `WB_SYNC_CONFIG` 不再参与判断。
 2. **模型答错自己的身份** → 模型无法内省，只能读文件或复述上下文里的旧答案。安装器往
    `AGENTS.md` 加了一条硬规则：被问当前模型时**必须现跑**
    `curl -s http://127.0.0.1:8787/wb/last-model`，禁止凭记忆回答。
 
-> 代价：配置默认会跟随「最后一次用过的模型」。临时用了 `gpt-6-sol` 之类，之后新建会话就会
-> 默认走它——要固定默认值就设 `WB_SYNC_CONFIG=0` 或在选择器切回来。
+> 代价：配置默认会跟随「最后一次用过的模型」（含区域）。临时用了 `ai/gpt-6-sol` 之类，
+> 之后新建会话就会默认走它——要固定默认值就设 `WB_FOLLOW_LAST_MODEL=0`，或用
+> `scripts\wb-model.cmd use <slug>` 明确设回来。
 
 ---
 
@@ -431,6 +551,10 @@ Codex 里有两层模型值，**极易误判**：
   `base_instructions` / `tool_mode` / `apply_patch_tool_type` …，与 OpenAI 形状完全不同。
   缺 `tool_mode` 等字段时，**0.16x 会认为「没有可用工具」而发 0 个工具**，模型就会说
   「没有可用的执行工具」。`gen-catalog.py` 已补齐。
+- **目录只在新建会话时读一次**：以前只有 `setup.py install` / `wb-model use` 会写
+  `workbuddy-catalog.json`，上游下线模型后选择器会一直挂着旧条目（Hy3 就是这样挂了很久）。
+  现在代理在启动时以及每次 `/v1/models` 后按 roster 重写该文件（内容没变就不动），
+  会话启动 hook 也会在文件超过 1 小时时触发一次刷新。
 - **profile 必须是独立文件**（0.162 起）：写在 `config.toml` 里的 `[profiles.x]` 会被判为
   legacy 并**直接报错**。所以 profile 是 `wb.config.toml`。
 - **版本要固定**：本机 `PATH` 里 `%LOCALAPPDATA%\hermes\node\codex` 排在前面，而那份 0.162.1 的
@@ -448,7 +572,19 @@ Codex 里有两层模型值，**极易误判**：
 - **PowerShell 脚本必须纯 ASCII**：5.1 按 ANSI/代码页读 `.ps1`，UTF-8 中文注释会变乱码并
   导致**解析失败**。
 
-### 限流（429）
+### 限流（429）：`14003` 与 `6004`
+
+1.6.0 起的限流分流由**本地代理**负责，Codex 的 429 重试预算设为 `0`，避免两层叠加。
+
+| 上游业务码 | 含义 | 代理行为 | 最终提示 |
+|---|---|---|---|
+| `14003` | 当前模型短时饱和 | 原请求 + 最多 4 次重试，等待约 2/5/10/20 秒（±15% 抖动） | 仍失败时返回 429，建议切换模型或稍后重试 |
+| `6004` | 账号频率窗口用尽 | 不重试，立即返回 | HTTP 400 + `rate_limit_account`，提示切换模型并按上游恢复时间等待 |
+
+`WB_14003_RETRIES=0..4` 可把重试次数调低；超过范围或非数字时使用安全默认值 4。
+该变量只影响 `14003`，不能把 `6004` 变成重试。
+
+以下是旧版记录的原始响应样例与背景：
 
 **是上游应用层的账号级限流，不是 CDN/WAF 拦截。** 完整响应体（直连上游抓的）：
 
@@ -466,6 +602,8 @@ Codex 里有两层模型值，**极易误判**：
 
 - **官方给了处置办法**：等约 1 分钟，或**换一个负载较低的模型**（换模型确实能绕过——实测有效）。
 - **瞬时性**：同一客户端连续请求会出现 429/200 交替（实测 1→429、2→200、3→429）。
+- **Codex 重试语义**：Codex 会对同一采样请求做退避重试，但不会合成一条新的
+  「继续任务 / go on」用户消息。本插件改为在代理层分类重试，并把 Codex 的 429 预算设为 0。
 - **不计费**：429 的请求不进 usage，账号积分不变。
 - **无法按需复现**：10 路并发 × 30 次 ≈ 90 万 token / 35 秒的压力测试**没触发**；
   它是按账号整体活跃度算的，压测打不出来。
@@ -476,8 +614,9 @@ Codex 里有两层模型值，**极易误判**：
 
 缓解：
 
-- provider 里已设 `request_max_retries = 6` / `stream_max_retries = 6`，让 Codex 多退避几次。
-- 撞到就**等一分钟**，或换模型（`hy3` / `deepseek-v4.1-flash` 之间来回切）。
+- provider 里已设 `request_max_retries = 0` / `stream_max_retries = 0`；重试由代理负责。
+- `14003` 会自动做有限短重试；仍失败就**等一分钟**，或换模型（`deepseek-v4.1-flash` / `hy4flash-free`）。
+- `6004` 会立即返回，应按上游给出的恢复时间等待，或切换模型。
 - 别让桌面端和 Codex 同时跑 agent 任务。
 
 **排查方式**：代理会把上游错误连同响应体记进日志（`上游错误 429: {...}`）。这个日志原本
@@ -500,16 +639,19 @@ Codex 里有两层模型值，**极易误判**：
 |---|---|
 | `wire_api = "chat" is no longer supported` | Codex 版本太新，必须走 `responses`（本包已实现） |
 | `400 code 11128 Illegal API invocation` | 上游指纹拦截。确认用的是本包代理（含 `sanitize_system`） |
-| `400 code 11128 / 请求被拦截 / request illegal` | 1.5.4 缺少三个 `X-Conversation-*` 头；升级到 1.5.5 并重启代理 |
+| `400 code 11128 / 请求被拦截 / request illegal` | 1.5.4 缺少三个 `X-Conversation-*` 头；升级到 1.6.0 并重启代理 |
 | 本地 provider 返回 `502 Bad Gateway: Unknown error` | 进程继承了失效的 `HTTP(S)_PROXY`。用 `codex-wb.cmd`，或清除代理变量后再启动 Codex |
 | 模型说「没有可用的执行工具」 | 模型目录缺 `tool_mode` 等字段 → 重跑 `gen-catalog.py` |
 | 桌面端模型列表只有 `gpt-6-*` / `daybreak-*` | `model_catalog_json` 没设或文件不存在 → 重跑安装 |
 | CLI 报 `Unknown model deepseek-v4.1-flash` | `wb.config.toml` 没引用 `workbuddy-catalog.json` → 重跑 `setup.py install` |
 | `--profile wb cannot be used ... legacy [profiles.wb]` | profile 写进了 `config.toml`，应放 `wb.config.toml` |
 | 一直「正在重新连接 N/N」 | 看错误里的 url。多半是**上游/中转的错**（例：中转返回 402 无有效订单），不是网络 |
-| `exceeded retry limit, last status: 429` | 上游边缘限流，见上文。放慢节奏，别同时跑桌面端 agent |
+| `code=14003` 后仍失败 | 代理已完成 4 次有限重试；切换模型或稍后重试 |
+| `code=6004` | 账号频率窗口用尽；立即切换模型或按上游恢复时间等待 |
+| 插入图片提示 `This model does not support image inputs` | 模型目录仍为 `input_modalities: ["text"]`。升级并重跑 `setup.py install`，完全退出桌面端后新建聊天 |
 | 问「当前模型」答错 | 模型没重新取数。确认 `AGENTS.md` 规则已装，或直接查 `/wb/last-model` |
 | 代理起不来 | WorkBuddy 桌面端未装 / 未登录；或凭据文件位置变了（见下） |
+| 选择器里国际版模型全没了 | 由 `hidden_regions` 主动隐藏（`/health` 里该区 `hidden: true`）。恢复：`wb-model.cmd show ai`；另有 `WORKBUDDY_AI_DISABLED=1` 会整区停用 |
 
 ### 日志与排查
 
@@ -551,12 +693,20 @@ Windows 上这类异常是 `ConnectionAbortedError`（WinError 10053），与 Li
 |---|---|---|
 | `WORKBUDDY_AI_PROXY_PORT` | `8787` | 代理端口 |
 | `WORKBUDDY_AI_PROXY_HOST` | `127.0.0.1` | 监听地址（**别改成 0.0.0.0**，见安全） |
-| `WORKBUDDY_AI_AUTH_FILE` | 自动探测 | 凭据文件路径 |
-| `WORKBUDDY_AI_APP` | 自动探测 | `WorkBuddyAI.exe` 路径 |
+| `WORKBUDDY_AI_AUTH_FILE` | 自动探测 | 国际版凭据文件路径 |
+| `WORKBUDDY_AI_APP` | 自动探测 | 国际版 `WorkBuddyAI.exe` 路径 |
+| `WORKBUDDY_CN_AUTH_FILE` | 自动探测 | 国内版凭据文件路径 |
+| `WORKBUDDY_CN_APP` | 自动探测 | 国内版 `WorkBuddy.exe` 路径 |
 | `WORKBUDDY_AI_PYTHON` | 自动探测 | 启动脚本用哪个 python |
-| `WB_SYNC_CONFIG` | `1` | 关掉配置同步 |
+| `WB_FOLLOW_LAST_MODEL` | `1` | 关掉「新建会话跟随上次实际使用的模型」 |
+| `WORKBUDDY_CN_DISABLED` / `WORKBUDDY_AI_DISABLED` | 未设 | 设为 `1` 整个区域停用（凭据也不加载，重启代理生效） |
+| `WORKBUDDY_HIDDEN_REGIONS` | 未设 | 逗号分隔的区域（如 `ai`），与设置文件合并；只影响选择器 |
+| `WB_SETTINGS` | `$CODEX_HOME/workbuddy-settings.json` | 覆盖设置文件位置（测试用） |
 | `WB_CODEX_CONFIG` | `$CODEX_HOME/config.toml` | 要同步的配置文件 |
 | `WB_USAGE_LOG` | 空 | 记 usage/积分的 jsonl 路径 |
+| `WB_14003_RETRIES` | `4` | `14003` 代理重试次数，允许 `0..4`；不影响 `6004` |
+| `WB_TRANSPORT_RETRIES` | `2` | 上游连接重置 / DNS 失败 / TLS EOF 的有界重试次数，允许 `0..3` |
+| `WB_DIAG_DIR` | `$CODEX_HOME/workbuddy-connect` | 结构化流诊断日志目录；超过 5MB 自动轮转一份 `.jsonl.1` |
 | `CODEX_WB_CODEX` | npm 全局 codex | 指定启动器用哪个 codex |
 | `WB_MODEL` | `deepseek-v4.1-flash` | 本地 `dev/` 脚本用哪个模型 |
 | `WB_ALLOW_PAID` | 未设 | 设为 `1` 才允许本地 `dev/` 跑计费模型 |
@@ -589,7 +739,7 @@ uninstall.cmd
   自己人之间小范围传无所谓，别放到公开仓库/网盘/社交平台。
 - **让每个使用者自己登录自己的账号**：不要把自己的凭据文件拷给别人（本包也不会为之提供便利）。
 
-**别滥用免费档**：`hy3` / `deepseek-v4.1-flash` / `step-5-preview` 实测 0 扣分，
+**别滥用免费档**：`deepseek-v4.1-flash` / `hy4flash-free` 实测 0 扣分，
 但高频跑会触发上游账号级限流（`code 14003`，429），影响的是自己的号。当它是个彩蛋，
 不要当免费 API 刷。
 
@@ -599,7 +749,7 @@ uninstall.cmd
 
 这些脚本**不包含在公开发布的仓库里**（含逆向分析与指纹定位内容），仅你本地排查时用。
 **默认全部走免费档**（`deepseek-v4.1-flash`，实测 0 扣分），
-换成别的模型用 `WB_MODEL=hy3` 之类。
+换成别的模型用 `WB_MODEL=deepseek-v4.1-flash` 之类。
 
 真正花钱的费率测量脚本（`_measure_*.py`、`_codex_bench.py`、`_compare_codex.py`）
 **默认拒绝运行**，必须显式同意，免得拿到包随手一跑就扣积分：

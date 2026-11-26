@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import os
+import json
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -30,12 +32,53 @@ def port() -> int:
         return DEFAULT_PORT
 
 
-def is_up(p: int) -> bool:
+def port_open(p: int) -> bool:
     try:
         with socket.create_connection(("127.0.0.1", p), timeout=0.4):
             return True
     except OSError:
         return False
+
+
+def is_up(p: int) -> bool:
+    """Return true only when the listener is this proxy and `/health` responds."""
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{p}/health", timeout=2) as response:
+            doc = json.loads(response.read().decode("utf-8", "replace"))
+        return isinstance(doc, dict) and doc.get("provider") in (
+            "workbuddy", "workbuddy-ai",
+        )
+    except Exception:
+        return False
+
+
+CATALOG_TTL_SEC = 3600.0
+
+
+def catalog_path() -> Path:
+    home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    return Path(os.environ.get("WB_CATALOG") or (home / "workbuddy-catalog.json"))
+
+
+def refresh_catalog(p: int) -> None:
+    """让选择器跟上上游的最新名单。
+
+    代理在 ``/v1/models`` 里会把当前 roster 落盘到 ``model_catalog_json``，
+    所以这里只需要探一次。文件还新（<1 小时）就跳过，别让每次开会话都等上游
+    ``/v3/config`` 的往返。失败不影响会话启动 —— hook 尽力而为。
+    """
+    try:
+        if time.time() - catalog_path().stat().st_mtime < CATALOG_TTL_SEC:
+            return
+    except OSError:
+        pass
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{p}/v1/models", timeout=15):
+            return
+    except Exception as e:
+        print(f"[workbuddy] 刷新模型目录失败：{type(e).__name__}: {e}", file=sys.stderr)
 
 
 def _utf8_output() -> None:
@@ -51,6 +94,14 @@ def main() -> int:
     _utf8_output()
     p = port()
     if is_up(p):
+        refresh_catalog(p)
+        return 0
+    if port_open(p):
+        print(
+            f"[workbuddy] 端口 {p} 已监听，但代理 /health 不健康；"
+            "看护会识别本插件进程并恢复，foreign 进程不会被终止",
+            file=sys.stderr,
+        )
         return 0
     if not PROXY.is_file():
         print(f"[workbuddy] 找不到代理脚本 {PROXY}", file=sys.stderr)
@@ -70,6 +121,7 @@ def main() -> int:
     for _ in range(40):
         if is_up(p):
             print(f"[workbuddy] 代理已就绪 http://127.0.0.1:{p}/v1")
+            refresh_catalog(p)
             return 0
         time.sleep(0.5)
 

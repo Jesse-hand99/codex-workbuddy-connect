@@ -1,7 +1,7 @@
 {
   "name": "codex-workbuddy-connect",
-  "version": "1.5.5",
-  "description": "把 WorkBuddy AI 桌面端已登录的模型接进 Codex（CLI 与桌面端），无需 OpenAI 订阅或 Codex 套餐。",
+  "version": "1.7.4-20261119091313",
+  "description": "把 WorkBuddy AI（国际版）与 WorkBuddy（国内版）桌面端已登录的模型同时接进 Codex（CLI 与桌面端）；查看两区账号昵称与剩余积分；结构化诊断流中断与上游 502。",
   "author": {
     "name": "Charlotte Lee"
   },
@@ -18,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "WorkBuddy Connect",
-    "shortDescription": "用 WorkBuddy 桌面端的模型驱动 Codex",
-    "longDescription": "把 WorkBuddy AI 桌面端已登录的模型变成 Codex 的模型源：本地代理解密桌面端登录态、把 Responses API 转成上游的 Chat Completions、并生成模型切换列表。另有 hy3 / deepseek-v4.1-flash / step-5-preview 三个实测 0 积分的免费档。附带 /workbuddy-setup 一键安装与 /workbuddy-status 自检命令。",
+    "shortDescription": "用 WorkBuddy 桌面端的模型驱动 Codex，并查看账号积分",
+    "longDescription": "把两个 WorkBuddy 桌面端的登录态合并成 Codex 的一个模型源：同一个本地代理、同一个 8787 端口，模型 ID 以 ai/ 与 cn/ 区分区域。新增账号与积分状态：按区域显示昵称、剩余 / 总积分和令牌有效期，可用 setup.py status --json 读取。代理解密登录态、把 Responses API 转成上游 Chat Completions、合并两套模型目录，并按区域隔离凭据、绝不跨区回退。附带 /workbuddy-setup、/workbuddy-status 与 wb-model。",
     "developerName": "Charlotte Lee",
     "category": "Developer Tools",
     "capabilities": [
@@ -30,8 +30,9 @@
     "defaultPrompt": [
       "用 /workbuddy-setup 把 WorkBuddy 模型接进 Codex",
       "当前实际在用哪个模型？",
-      "WorkBuddy 代理连不上，帮我排查"
+      "WorkBuddy 国内版和国际版怎么切换？"
     ],
     "brandColor": "#0F766E"
-  }
+  },
+  "longDescription": "把两个 WorkBuddy 桌面端的登录态合并成 Codex 的一个模型源：同一个本地代理、同一个 8787 端口，模型 ID 以 ai/ 与 cn/ 区分区域。新增 hidden_regions：某个区域上游不可用时只从模型选择器隐藏，账号与积分仍可查，恢复用 wb-model.cmd show <ai|cn>。新增账号与积分状态：按区域显示昵称、剩余 / 总积分和令牌有效期，可用 setup.py status --json 读取。代理解密登录态、把 Responses API 转成上游 Chat Completions、按实时 agents.cli.models 合并模型目录（显示名与桌面端一致，档位快捷项「快速/均衡/极致」不收录），目录文件随上游名单自动刷新，并按区域隔离凭据、绝不跨区回退。附带 /workbuddy-setup、/workbuddy-status 与 wb-model。"
 }

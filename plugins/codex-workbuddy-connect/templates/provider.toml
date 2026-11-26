@@ -1,13 +1,20 @@
 # 追加到 %USERPROFILE%\.codex\config.toml
 # （install.cmd 会自动写入；这里是手工安装时的参考）
+#
+# 一个 provider、一个端口同时服务两个区域：
+#   ai/*  → WorkBuddy AI（国际版，workbuddy.ai）
+#   cn/*  → WorkBuddy（国内版，copilot.tencent.com）
+# 不带前缀的旧模型 ID 仍按国际版处理。
 
 [model_providers.workbuddy]
 name = "WorkBuddy"
-base_url = "http://localhost:8787/v1"
+# 固定回环 IP，避免 localhost/DNS 偶发解析失败（WinError 11001）。
+base_url = "http://127.0.0.1:8787/v1"
 # 本地代理不校验密钥，占位即可（真正的登录态在代理里）
 experimental_bearer_token = "workbuddy-local"
 wire_api = "responses"
 requires_openai_auth = false
-# 上游会返回 429，给足退避重试次数
-request_max_retries = 6
-stream_max_retries = 6
+# 429 由本地代理分类处理：14003 有界重试，6004 立即返回。
+# Codex 不再重试 429，避免两层重试相乘放大请求。
+request_max_retries = 0
+stream_max_retries = 0
